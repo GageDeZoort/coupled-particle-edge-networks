@@ -1,0 +1,634 @@
+"""GMM chunks of a DES cell in proper-motion space.
+
+Each 5° cell is partitioned into ``k`` Gaussians in ``(μ_φ, μ_λ)``. That is a
+label-free tessellation for graph construction, not a membership cut: keep
+every component. Do not drop "wide" Gaussians and do not pick the component
+with the most mock stars.
+
+A covariance floor at a Gaia-like PM error (~0.5 mas/yr) stops unsmeared mock
+kinematics from collapsing onto a delta-function component.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.mixture import GaussianMixture
+
+from cpen.apps.streams.preprocess.galaxy import ensure_is_mock_stream
+
+GMM_N_COMPONENTS = 16
+PM_FLOOR_MAS_YR = 0.5
+GMM_LABEL_COL = "gmm_label"
+GMM_WIDTH_COL = "gmm_width"
+
+# Diagnostic QC rubric only — not a membership cut, not a graph filter.
+QC_LOCALIZED_SHARE = 0.70
+QC_LOCALIZED_ENRICH = 4.0
+QC_DILUTE_ENRICH = 2.0
+QC_SPLIT_SHARE = 0.50
+QC_MIN_MOCK = 30
+
+
+@dataclass
+class PMGMMFit:
+    """MAP assignment plus the fitted Gaussians (for ellipses / occupancy)."""
+
+    labels: np.ndarray
+    widths: np.ndarray
+    means: np.ndarray
+    covariances: np.ndarray
+    n_components: int
+    n_fit: int
+    gmm: GaussianMixture | None
+
+
+def fit_pm_gmm(
+    pm_phi,
+    pm_lam,
+    n_components: int = GMM_N_COMPONENTS,
+    n_init: int = 3,
+    random_state: int = 0,
+    max_fit_samples: int = 50_000,
+    pm_floor: float = PM_FLOOR_MAS_YR,
+) -> PMGMMFit:
+    """Fit a GMM on finite PM. Non-finite rows get label ``-1``.
+
+    ``widths`` is the largest RMS axis of each covariance (mas/yr), after the
+    ``pm_floor`` diagonal regularizer.
+    """
+    pm_phi = np.asarray(pm_phi, dtype=float)
+    pm_lam = np.asarray(pm_lam, dtype=float)
+    if pm_phi.shape != pm_lam.shape:
+        raise ValueError("pm_phi and pm_lam must have the same shape")
+
+    n = pm_phi.size
+    labels = np.full(n, -1, dtype=np.int32)
+    finite = np.isfinite(pm_phi) & np.isfinite(pm_lam)
+    n_finite = int(finite.sum())
+    k = int(n_components)
+    empty = PMGMMFit(
+        labels=labels,
+        widths=np.full(k, np.nan),
+        means=np.full((k, 2), np.nan),
+        covariances=np.full((k, 2, 2), np.nan),
+        n_components=k,
+        n_fit=0,
+        gmm=None,
+    )
+    if n_finite < k * 3:
+        return empty
+
+    X = np.column_stack([pm_phi[finite], pm_lam[finite]])
+    if n_finite > max_fit_samples:
+        rng = np.random.default_rng(random_state)
+        X_fit = X[rng.choice(n_finite, max_fit_samples, replace=False)]
+    else:
+        X_fit = X
+
+    gmm = GaussianMixture(
+        n_components=k,
+        covariance_type="full",
+        n_init=n_init,
+        random_state=random_state,
+        reg_covar=float(pm_floor) ** 2,
+    )
+    gmm.fit(X_fit)
+    labels[finite] = gmm.predict(X)
+    evals = np.linalg.eigvalsh(gmm.covariances_)
+    widths = np.sqrt(np.clip(evals.max(axis=1), 0.0, None))
+    return PMGMMFit(
+        labels=labels,
+        widths=widths,
+        means=np.asarray(gmm.means_, dtype=float),
+        covariances=np.asarray(gmm.covariances_, dtype=float),
+        n_components=k,
+        n_fit=n_finite,
+        gmm=gmm,
+    )
+
+
+def assign_gmm_to_cell(
+    df: pd.DataFrame,
+    n_components: int = GMM_N_COMPONENTS,
+    pm_phi_col: str = "pm_phi",
+    pm_lam_col: str = "pm_lam",
+    **fit_kwargs,
+) -> tuple[pd.DataFrame, PMGMMFit]:
+    """Add ``gmm_label`` / ``gmm_width`` on a copy of ``df``."""
+    out = df.copy()
+    fit = fit_pm_gmm(
+        out[pm_phi_col].to_numpy(),
+        out[pm_lam_col].to_numpy(),
+        n_components=n_components,
+        **fit_kwargs,
+    )
+    out[GMM_LABEL_COL] = fit.labels
+    width_star = np.full(len(out), np.nan)
+    ok = fit.labels >= 0
+    if ok.any() and np.isfinite(fit.widths).any():
+        width_star[ok] = fit.widths[fit.labels[ok]]
+    out[GMM_WIDTH_COL] = width_star
+    return out, fit
+
+
+def assign_gmm_to_cells(
+    cell_dfs: dict,
+    n_components: int = GMM_N_COMPONENTS,
+    verbose: bool = True,
+    progress_every: int = 1,
+    **fit_kwargs,
+) -> tuple[dict, dict[int, PMGMMFit], pd.DataFrame]:
+    """Fit one GMM per DES cell. Returns ``(cell_dfs, fits, occupancy)``.
+
+    With ``verbose=True`` (default), prints each finished cell immediately
+    (``flush=True``) so a notebook shows progress before the loop ends.
+    """
+    import time
+
+    out = {}
+    fits: dict[int, PMGMMFit] = {}
+    rows = []
+    n_cells = len(cell_dfs)
+    t0 = time.perf_counter()
+    if verbose:
+        print(
+            f"Fitting GMM k={n_components} on {n_cells} cells "
+            f"(progress every {progress_every})…",
+            flush=True,
+        )
+    for i, (cid, df) in enumerate(sorted(cell_dfs.items(), key=lambda kv: int(kv[0])), start=1):
+        t_cell = time.perf_counter()
+        assigned, fit = assign_gmm_to_cell(df, n_components=n_components, **fit_kwargs)
+        dt = time.perf_counter() - t_cell
+        assigned = ensure_is_mock_stream(assigned)
+        out[cid] = assigned
+        fits[cid] = fit
+        rows.append(_cell_occupancy_row(cid, assigned, fit))
+        if verbose and (i % progress_every == 0 or i == n_cells):
+            elapsed = time.perf_counter() - t0
+            eta = (elapsed / i) * (n_cells - i)
+            n_mock = int(assigned["is_mock_stream"].sum()) if "is_mock_stream" in assigned.columns else 0
+            print(
+                f"  [{i:3d}/{n_cells}] cell {int(cid):4d}  "
+                f"N_fit={fit.n_fit:>7,}  mocks={n_mock:4d}  "
+                f"{dt:5.1f}s  elapsed {elapsed / 60:5.1f}m  ETA {eta / 60:5.1f}m",
+                flush=True,
+            )
+    occ = pd.DataFrame(rows)
+    if verbose:
+        elapsed = time.perf_counter() - t0
+        print(f"Done: {n_cells} cells in {elapsed / 60:.1f} min", flush=True)
+    return out, fits, occ
+
+
+def gmm_component_table(df: pd.DataFrame, cell_id=None) -> pd.DataFrame:
+    """One row per GMM component in a cell (label ``-1`` omitted)."""
+    df = ensure_is_mock_stream(df)
+    if GMM_LABEL_COL not in df.columns:
+        raise KeyError(f"{GMM_LABEL_COL} missing; run assign_gmm_to_cell first")
+    is_mock = df["is_mock_stream"].to_numpy(bool)
+    labels = df[GMM_LABEL_COL].to_numpy(int)
+    widths = df[GMM_WIDTH_COL].to_numpy(float) if GMM_WIDTH_COL in df.columns else None
+    rows = []
+    for k in np.unique(labels):
+        if k < 0:
+            continue
+        m = labels == k
+        n_stars = int(m.sum())
+        n_mock = int((m & is_mock).sum())
+        n_other = n_stars - n_mock
+        w = float(np.nanmedian(widths[m])) if widths is not None else np.nan
+        rows.append({
+            "cell_id": cell_id,
+            "gmm_label": int(k),
+            "n_stars": n_stars,
+            "n_mock": n_mock,
+            "n_other": n_other,
+            "mock_frac": n_mock / n_stars if n_stars else np.nan,
+            "width": w,
+        })
+    return pd.DataFrame(rows)
+
+
+def _cell_occupancy_row(cell_id, df: pd.DataFrame, fit: PMGMMFit) -> dict:
+    df = ensure_is_mock_stream(df)
+    is_mock = df["is_mock_stream"].to_numpy(bool)
+    labels = df[GMM_LABEL_COL].to_numpy(int)
+    n_stars = int((labels >= 0).sum())
+    n_mock = int(((labels >= 0) & is_mock).sum())
+    n_unlabeled = int((labels < 0).sum())
+    n_comp_used = int(np.unique(labels[labels >= 0]).size) if n_stars else 0
+    n_comp_with_mock = 0
+    richest_share = np.nan
+    richest_n_mock = 0
+    richest_n_stars = 0
+    richest_purity = np.nan
+    richest_k = -1
+    top2_share = np.nan
+    n_eff = np.nan
+    cell_mock_frac = n_mock / n_stars if n_stars else np.nan
+    enrichment = np.nan
+    size_frac = np.nan
+    mock_rms = np.nan
+    other_rms = np.nan
+    if n_mock > 0:
+        mock_labels = labels[is_mock & (labels >= 0)]
+        if mock_labels.size:
+            uniq, counts = np.unique(mock_labels, return_counts=True)
+            n_comp_with_mock = int(uniq.size)
+            i_max = int(np.argmax(counts))
+            richest_k = int(uniq[i_max])
+            richest_n_mock = int(counts[i_max])
+            richest_share = richest_n_mock / n_mock
+            richest_n_stars = int((labels == richest_k).sum())
+            richest_purity = richest_n_mock / richest_n_stars if richest_n_stars else np.nan
+            order = np.argsort(counts)[::-1]
+            top2_share = float(counts[order[:2]].sum() / n_mock)
+            p = counts.astype(float) / n_mock
+            n_eff = float(1.0 / np.sum(p ** 2))
+            size_frac = richest_n_stars / n_stars if n_stars else np.nan
+            if cell_mock_frac and cell_mock_frac > 0 and np.isfinite(richest_purity):
+                enrichment = richest_purity / cell_mock_frac
+            mock_rms, other_rms = _host_pm_rms(df, labels, is_mock, richest_k)
+    qc_tag = localization_tag(richest_share, enrichment, n_mock=n_mock)
+    sizes = np.array([(labels == k).sum() for k in range(fit.n_components)])
+    return {
+        "cell_id": int(cell_id),
+        "n_stars": n_stars,
+        "n_mock": n_mock,
+        "n_unlabeled": n_unlabeled,
+        "n_comp_used": n_comp_used,
+        "n_comp_with_mock": n_comp_with_mock,
+        "richest_k": richest_k,
+        "richest_n_mock": richest_n_mock,
+        "richest_share": richest_share,
+        "richest_n_stars": richest_n_stars,
+        "richest_purity": richest_purity,
+        "median_comp_size": float(np.median(sizes[sizes > 0])) if (sizes > 0).any() else np.nan,
+        "max_comp_size": int(sizes.max()) if sizes.size else 0,
+        "min_comp_size": int(sizes[sizes > 0].min()) if (sizes > 0).any() else 0,
+        "n_fit": int(fit.n_fit),
+        "top2_share": top2_share,
+        "n_eff": n_eff,
+        "cell_mock_frac": cell_mock_frac,
+        "enrichment": enrichment,
+        "size_frac": size_frac,
+        "qc_tag": qc_tag,
+        "mock_rms": mock_rms,
+        "other_rms": other_rms,
+    }
+
+
+def occupancy_from_cells(cell_dfs: dict, n_components: int | None = None) -> pd.DataFrame:
+    """Rebuild the occupancy table from assigned ``gmm_label`` columns (no refit)."""
+    rows = []
+    for cid, df in sorted(cell_dfs.items(), key=lambda kv: int(kv[0])):
+        df = ensure_is_mock_stream(df)
+        if GMM_LABEL_COL not in df.columns:
+            continue
+        labels = df[GMM_LABEL_COL].to_numpy(int)
+        k = int(n_components) if n_components is not None else (
+            int(labels.max()) + 1 if (labels >= 0).any() else 1
+        )
+        dummy = PMGMMFit(
+            labels=labels,
+            widths=np.full(k, np.nan),
+            means=np.full((k, 2), np.nan),
+            covariances=np.full((k, 2, 2), np.nan),
+            n_components=k,
+            n_fit=int((labels >= 0).sum()),
+            gmm=None,
+        )
+        rows.append(_cell_occupancy_row(cid, df, dummy))
+    return pd.DataFrame(rows)
+
+
+def localization_tag(share, enrichment, n_mock=0, min_mock=QC_MIN_MOCK) -> str:
+    """Rubric for whether GMM put mocks in one Gaussian. Diagnostic only."""
+    if n_mock <= 0 or not np.isfinite(share):
+        return "empty"
+    if n_mock < min_mock:
+        return "sparse"
+    if share >= QC_LOCALIZED_SHARE and np.isfinite(enrichment) and enrichment >= QC_LOCALIZED_ENRICH:
+        return "localized"
+    if share < QC_SPLIT_SHARE:
+        return "split"
+    if share >= QC_LOCALIZED_SHARE and (not np.isfinite(enrichment) or enrichment < QC_DILUTE_ENRICH):
+        return "dilute"
+    return "partial"
+
+
+def _host_pm_rms(df: pd.DataFrame, labels: np.ndarray, is_mock: np.ndarray, richest_k: int):
+    """2D PM RMS of mocks vs field in the mock-richest component (mas/yr)."""
+    if richest_k < 0 or "pm_phi" not in df.columns or "pm_lam" not in df.columns:
+        return np.nan, np.nan
+    pm = np.column_stack([
+        df["pm_phi"].to_numpy(float),
+        df["pm_lam"].to_numpy(float),
+    ])
+    host = (labels == richest_k) & np.isfinite(pm).all(axis=1)
+    if host.sum() < 5:
+        return np.nan, np.nan
+    cen = np.nanmedian(pm[host], axis=0)
+    def _rms(mask):
+        if mask.sum() < 2:
+            return np.nan
+        d = pm[mask] - cen
+        return float(np.sqrt(np.mean(np.sum(d * d, axis=1))))
+    return _rms(host & is_mock), _rms(host & ~is_mock)
+
+
+def print_gmm_localization(occ: pd.DataFrame, min_mock: int = QC_MIN_MOCK, n_components: int = GMM_N_COMPONENTS):
+    """Did the GMM put mocks in one Gaussian? Prints a QC summary, not a cut."""
+    if "qc_tag" not in occ.columns:
+        raise KeyError("occupancy table missing qc_tag; rebuild with occupancy_from_cells")
+    rich = occ[occ.n_mock >= min_mock].copy()
+    print("=" * 72)
+    print(f"GMM localization QC  (k={n_components}, cells with ≥{min_mock} mocks)")
+    print("=" * 72)
+    print(
+        "  localized: share of mocks in one Gaussian ≥ "
+        f"{QC_LOCALIZED_SHARE:.0%} and enrichment ≥ {QC_LOCALIZED_ENRICH:.0f}× the cell"
+    )
+    print(
+        f"  split:     richest Gaussian has < {QC_SPLIT_SHARE:.0%} of the mocks"
+    )
+    print(
+        f"  dilute:    mocks sit in one Gaussian but that blob is almost the whole cell "
+        f"(enrichment < {QC_DILUTE_ENRICH:.0f})"
+    )
+    print("  This is a fit check. Do not drop components from these tags.")
+    print()
+    if not len(rich):
+        print(f"  No cells with ≥{min_mock} mocks.")
+        return
+    counts = rich.qc_tag.value_counts()
+    for tag in ("localized", "partial", "split", "dilute", "sparse"):
+        n = int(counts.get(tag, 0))
+        if n:
+            print(f"  {tag:10s}  {n:3d} / {len(rich)}  ({100 * n / len(rich):.0f}%)")
+    print()
+    print(
+        f"  median share in one Gaussian: {100 * rich.richest_share.median():.0f}%"
+        f"   (top-2: {100 * rich.top2_share.median():.0f}%)"
+    )
+    print(
+        f"  median enrichment:            {rich.enrichment.median():.1f}× "
+        f"(1× = mocks follow component sizes at random)"
+    )
+    print(f"  median effective #Gaussians:  {rich.n_eff.median():.2f}   (1 = all mocks in one)")
+    if "mock_rms" in rich.columns and rich.mock_rms.notna().any():
+        print(
+            f"  median PM RMS in host blob:   mocks {rich.mock_rms.median():.2f} mas/yr  "
+            f"vs field {rich.other_rms.median():.2f} mas/yr"
+        )
+        colder = rich[rich.mock_rms.notna() & rich.other_rms.notna() & (rich.mock_rms < 0.5 * rich.other_rms)]
+        print(
+            f"  host blobs where mocks are <½ field RMS: {len(colder)} / {len(rich)}  "
+            "(stream is a cold spike inside a fatter Gaussian)"
+        )
+    print()
+    cols = [
+        "cell_id", "qc_tag", "n_mock", "richest_share", "top2_share",
+        "enrichment", "n_eff", "n_comp_with_mock", "richest_purity",
+        "richest_n_stars", "mock_rms", "other_rms",
+    ]
+    cols = [c for c in cols if c in rich.columns]
+    print("===== Best localized (highest enrichment) =====")
+    display_df = rich.sort_values("enrichment", ascending=False)[cols].head(8)
+    print(display_df.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+    print()
+    print("===== Most split (lowest richest_share) =====")
+    display_df = rich.sort_values("richest_share", ascending=True)[cols].head(8)
+    print(display_df.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+
+def mock_stream_localization(
+    cell_dfs: dict,
+    stream_col: str = "stream_label",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Per mock stream: how many (cell, GMM) chunks, and the single richest share.
+
+    A stream can be localized *inside each cell* and still fragmented across
+    overlapping DES cells. Both numbers matter.
+    """
+    recs = []
+    for cid, df in cell_dfs.items():
+        df = ensure_is_mock_stream(df)
+        if GMM_LABEL_COL not in df.columns or stream_col not in df.columns:
+            continue
+        m = df["is_mock_stream"].to_numpy(bool) & (df[GMM_LABEL_COL].to_numpy(int) >= 0)
+        if not m.any():
+            continue
+        sub = df.loc[m, [stream_col, GMM_LABEL_COL]]
+        for (lab, k), part in sub.groupby([stream_col, GMM_LABEL_COL], sort=False):
+            recs.append({
+                "stream_label": lab,
+                "cell_id": int(cid),
+                "gmm_label": int(k),
+                "n": int(len(part)),
+            })
+    chunks = pd.DataFrame(recs)
+    if not len(chunks):
+        return pd.DataFrame(), chunks
+    rows = []
+    for lab, g in chunks.groupby("stream_label", sort=False):
+        n_tot = int(g.n.sum())
+        i = g.n.idxmax()
+        rows.append({
+            "stream_label": lab,
+            "n_mock": n_tot,
+            "n_cells": int(g.cell_id.nunique()),
+            "n_chunks": int(len(g)),
+            "best_cell": int(g.loc[i, "cell_id"]),
+            "best_k": int(g.loc[i, "gmm_label"]),
+            "best_n": int(g.loc[i, "n"]),
+            "best_share": float(g.loc[i, "n"] / n_tot),
+        })
+    summary = pd.DataFrame(rows).sort_values("n_mock", ascending=False).reset_index(drop=True)
+    return summary, chunks
+
+
+def print_gmm_occupancy(occ: pd.DataFrame, n_components: int = GMM_N_COMPONENTS, min_mock: int = 30):
+    """Print how the k-GMM splits each cell; mocks are diagnostics, not a cut."""
+    print(f"GMM k={n_components} on {len(occ)} DES cells")
+    if not len(occ):
+        return
+    print(
+        f"  stars/cell (labeled):  median {occ.n_stars.median():,.0f}  "
+        f"[{occ.n_stars.min():,}–{occ.n_stars.max():,}]"
+    )
+    print(
+        f"  stars/component:       median {occ.median_comp_size.median():,.0f}  "
+        f"(cell min/max of occupied comps: "
+        f"{occ.min_comp_size.median():,.0f} / {occ.max_comp_size.median():,.0f})"
+    )
+    rich = occ[occ.n_mock >= min_mock]
+    print(f"  cells with ≥{min_mock} mocks: {len(rich)}")
+    if len(rich):
+        print(
+            f"  mocks in one component: median {100 * rich.richest_share.median():.0f}%  "
+            f"(this is a diagnostic; do not select that component)"
+        )
+        print(
+            f"  #components with ≥1 mock: median {rich.n_comp_with_mock.median():.0f}  "
+            f"[{int(rich.n_comp_with_mock.min())}–{int(rich.n_comp_with_mock.max())}]"
+        )
+        print(
+            f"  richest-comp size:     median {rich.richest_n_stars.median():,.0f}  "
+            f"purity {rich.richest_purity.median():.4f}"
+        )
+    empty = occ[occ.n_mock == 0]
+    print(f"  empty (0 mock) cells: {len(empty)}  — negative-control chunks")
+
+
+def _star_keys(df: pd.DataFrame) -> np.ndarray:
+    if "star_id" in df.columns:
+        return df["star_id"].to_numpy()
+    if "ra_des" in df.columns and "dec_des" in df.columns:
+        ra = np.round(df["ra_des"].to_numpy(float), 6)
+        dec = np.round(df["dec_des"].to_numpy(float), 6)
+        return np.array(list(zip(ra, dec)), dtype=object)
+    raise KeyError("Need star_id or ra_des/dec_des to aggregate unique stars over the sky")
+
+
+def collect_gmm_width_assignments(cell_dfs: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Per (cell, star) widths, plus unique-star min width over overlapping cells.
+
+    Unique-star ``gmm_width`` is the **minimum** over cells: a star is kept by
+    ``w ≤ W`` if *any* cell assigns it to a Gaussian that narrow. That is the
+    sky-wide completeness of the cut as applied independently per DES cell.
+    """
+    rows = []
+    for cid, df in cell_dfs.items():
+        df = ensure_is_mock_stream(df)
+        if GMM_LABEL_COL not in df.columns or GMM_WIDTH_COL not in df.columns:
+            continue
+        labels = df[GMM_LABEL_COL].to_numpy(int)
+        keep = labels >= 0
+        if not keep.any():
+            continue
+        sub = df.loc[keep]
+        rows.append(pd.DataFrame({
+            "star_id": _star_keys(sub),
+            "cell_id": int(cid),
+            "gmm_label": sub[GMM_LABEL_COL].to_numpy(int),
+            "gmm_width": sub[GMM_WIDTH_COL].to_numpy(float),
+            "is_mock_stream": sub["is_mock_stream"].to_numpy(bool),
+        }))
+    if not rows:
+        empty = pd.DataFrame(columns=["star_id", "cell_id", "gmm_label", "gmm_width", "is_mock_stream"])
+        return empty, empty
+    pairs = pd.concat(rows, ignore_index=True)
+    unique = (
+        pairs.groupby("star_id", sort=False)
+        .agg(
+            is_mock_stream=("is_mock_stream", "max"),
+            gmm_width=("gmm_width", "min"),
+            gmm_width_max=("gmm_width", "max"),
+            n_cells=("cell_id", "nunique"),
+        )
+        .reset_index()
+    )
+    return pairs, unique
+
+
+def sweep_gmm_width(
+    cell_dfs: dict,
+    thresholds=None,
+    mock_keep_targets=(0.99, 0.95, 0.90, 0.80),
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Sky-wide mock/other efficiency vs GMM-width upper bound.
+
+    Returns ``(sweep, unique_stars, operating_points)``. Efficiencies use
+    unique stars (overlapping DES cells counted once).
+    """
+    pairs, unique = collect_gmm_width_assignments(cell_dfs)
+    if not len(unique):
+        return pd.DataFrame(), unique, pd.DataFrame()
+
+    is_mock = unique["is_mock_stream"].to_numpy(bool)
+    width = unique["gmm_width"].to_numpy(float)
+    finite = np.isfinite(width)
+    is_mock, width = is_mock[finite], width[finite]
+    n_mock = int(is_mock.sum())
+    n_other = int((~is_mock).sum())
+
+    if thresholds is None:
+        lo = float(np.nanpercentile(width, 1))
+        hi = float(np.nanpercentile(width, 99.5))
+        lo = min(lo, PM_FLOOR_MAS_YR)
+        hi = max(hi, lo + 0.5)
+        thresholds = np.unique(np.concatenate([
+            np.linspace(lo, hi, 36),
+            np.array([PM_FLOOR_MAS_YR, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]),
+        ]))
+        thresholds = thresholds[(thresholds >= 0) & np.isfinite(thresholds)]
+
+    rows = []
+    for t in thresholds:
+        keep = width <= t
+        n_m = int((is_mock & keep).sum())
+        n_o = int((~is_mock & keep).sum())
+        rows.append({
+            "threshold": float(t),
+            "n_mock": n_m,
+            "n_other": n_o,
+            "mock_frac": n_m / n_mock if n_mock else np.nan,
+            "other_frac": n_o / n_other if n_other else np.nan,
+            "purity": n_m / (n_m + n_o) if (n_m + n_o) else np.nan,
+        })
+    sweep = pd.DataFrame(rows).sort_values("threshold").reset_index(drop=True)
+
+    ops = []
+    for tgt in mock_keep_targets:
+        ok = sweep[sweep.mock_frac >= tgt]
+        if not len(ok):
+            pick = sweep.iloc[-1]
+        else:
+            pick = ok.iloc[0]
+        ops.append({
+            "mock_keep_target": tgt,
+            "threshold": float(pick.threshold),
+            "mock_frac": float(pick.mock_frac),
+            "other_frac": float(pick.other_frac),
+            "purity": float(pick.purity),
+        })
+    operating = pd.DataFrame(ops)
+
+    n_overlap = int((unique.n_cells > 1).sum()) if "n_cells" in unique.columns else 0
+    print("=" * 72)
+    print("GMM width cut  (unique stars over the DES footprint)")
+    print("=" * 72)
+    print(f"  unique labeled stars: {len(unique):,}  mocks {n_mock:,}  other {n_other:,}")
+    print(f"  in >1 overlapping cell: {n_overlap:,}  (width = min over cells)")
+    print(
+        "  Mock PMs are unsmeared; the mock-efficiency curve is optimistic. "
+        "Carry a looser W to other galaxies than the mock-optimal point."
+    )
+    print()
+    print("===== Operating points (first W with mock_frac ≥ target) =====")
+    print(operating.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    return sweep, unique, operating
+
+
+def save_gmm_cells(cell_dfs: dict, outdir, subdir: str = "cells_gmm_k16") -> Path:
+    out = Path(outdir) / subdir
+    out.mkdir(parents=True, exist_ok=True)
+    for cell_id, df in cell_dfs.items():
+        df.to_parquet(out / f"cell_{int(cell_id):04d}.parquet", index=False)
+    return out
+
+
+def load_gmm_cells(outdir, subdir: str = "cells_gmm_k16") -> dict | None:
+    d = Path(outdir) / subdir
+    if not d.is_dir():
+        return None
+    cell_dfs = {}
+    for fp in sorted(d.glob("cell_*.parquet")):
+        cell_id = int(fp.stem.split("_")[1])
+        cell_dfs[cell_id] = ensure_is_mock_stream(pd.read_parquet(fp))
+    return cell_dfs or None

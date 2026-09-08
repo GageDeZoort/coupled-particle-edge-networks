@@ -1,0 +1,1 @@
+"""MNISTSuperpixels application."""

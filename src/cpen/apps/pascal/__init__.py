@@ -1,0 +1,1 @@
+"""PascalVOC-SP application."""

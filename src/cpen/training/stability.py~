@@ -1,0 +1,731 @@
+"""Forward / one-step backward feature-norm diagnostics for CPEN and CAPEN.
+
+The μP / coupled-network theory says hidden states stay Θ(1) in the
+coordinate
+
+    ρ_t^{(ℓ)} = ||Z_t^{(ℓ)}||_F² / (N_t D)
+
+and that a transferred Adam step (η = η₀ / √D) moves those states by an
+amount that does not blow up with width. ``t`` indexes the particle (X) and
+edge (E) streams.
+
+Enable the bytecode ``_feature_probe`` list, run a shared jets batch through a
+depth/width ladder, and plot ρ and Δρ vs parameter count.
+"""
+
+from __future__ import annotations
+
+import gc
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from cpen.models.base import adam_lr
+from cpen.training.transfer_plots import DEFAULT_FIG_DIR, savefig
+
+ADAM_EPS = 1e-14
+
+# After a CUDA OOM, IPython keeps the traceback frame (and every tensor it
+# referenced). That is why a later L=2 forward can fail with 9 GiB already
+# allocated in this process.
+_STALE_CUDA_GIB = 2.0
+
+# (L, D) = (2, 128), (3, 192), …  matches D = 64 L.
+DEFAULT_ARCHS: tuple[tuple[int, int], ...] = tuple(
+    [(2, 128), (3,192), (4,256), (5,384), (6,512), (7,768), (8,1024)]
+)
+
+FORWARD_KW = (
+    "incidence",
+    "incidence_node",
+    "incidence_edge",
+    "incidence_nnz",
+    "node_degree_inv",
+    "edge_degree_inv",
+    "mask",
+    "z",
+    "wire_coordinates",
+    "edge_type",
+    "edge_mask",
+    "node_mask",
+)
+
+
+@dataclass(frozen=True)
+class ProbeSnap:
+    """Detached hidden states at one residual stage."""
+
+    stage: str
+    h_x: torch.Tensor
+    h_e: torch.Tensor
+    node_mask: torch.Tensor | None
+    edge_mask: torch.Tensor | None
+
+
+def cuda_mem_line() -> str:
+    if not torch.cuda.is_available():
+        return "cuda: unavailable"
+    free, total = torch.cuda.mem_get_info()
+    alloc = torch.cuda.memory_allocated()
+    idx = torch.cuda.current_device()
+    name = torch.cuda.get_device_name(idx)
+    return (
+        f"{name}  allocated={alloc / 2**30:.2f} GiB  "
+        f"used={(total - free) / 2**30:.2f}/{total / 2**30:.2f} GiB"
+    )
+
+
+def release_cuda() -> None:
+    """Drop IPython's last exception frames, then free cached CUDA blocks."""
+    for name in ("last_traceback", "last_type", "last_value", "last_exc"):
+        if hasattr(sys, name):
+            setattr(sys, name, None)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def n_trainable(model: nn.Module) -> int:
+    return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+
+def last_layer_stage(depth: int) -> str:
+    return f"layer{int(depth) - 1}"
+
+
+def masked_msq(z: torch.Tensor, mask: torch.Tensor | None = None) -> float:
+    """||Z||_F² / (N_t D) over valid tokens (batch as one token pool)."""
+    zf = z.detach().float()
+    if zf.dim() != 3:
+        raise ValueError(f"expected (batch, tokens, D); got {tuple(zf.shape)}")
+    width = zf.size(-1)
+    sq = zf.square()
+    if mask is None:
+        return float(sq.mean())
+    w = mask.detach().to(dtype=zf.dtype)
+    if w.shape != zf.shape[:2]:
+        raise ValueError(f"mask shape {tuple(w.shape)} != tokens {tuple(zf.shape[:2])}")
+    n_valid = float(w.sum().clamp_min(1.0))
+    return float((sq * w.unsqueeze(-1)).sum() / (n_valid * width))
+
+
+def edge_mask_from_batch(batch: dict[str, torch.Tensor], n_edges: int) -> torch.Tensor | None:
+    if batch.get("edge_mask") is not None:
+        return batch["edge_mask"].bool()
+    inc = batch.get("incidence")
+    if inc is not None:
+        return inc.bool().any(dim=-1)
+    return None
+
+
+def parse_probe(
+    probe: Sequence[tuple],
+    *,
+    node_mask: torch.Tensor | None,
+    edge_mask: torch.Tensor | None,
+) -> dict[str, ProbeSnap]:
+    """Index probe tuples ``(stage, h_x, h_e, mask)`` by stage name."""
+    out: dict[str, ProbeSnap] = {}
+    for item in probe:
+        stage, h_x, h_e, probe_mask = item[:4]
+        nm = probe_mask if probe_mask is not None else node_mask
+        em = edge_mask
+        if em is None:
+            em = h_e.detach().abs().sum(dim=-1) > 0
+        out[str(stage)] = ProbeSnap(str(stage), h_x, h_e, nm, em)
+    return out
+
+
+def enable_probe(model: nn.Module) -> list:
+    probe: list = []
+    model._feature_probe = probe  # type: ignore[attr-defined]
+    return probe
+
+
+def disable_probe(model: nn.Module) -> None:
+    """Stop recording. ``None`` is the bytecode no-op sentinel."""
+    model._feature_probe = None  # type: ignore[attr-defined]
+
+
+def _forward_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {
+        key: batch[key]
+        for key in FORWARD_KW
+        if key in batch and batch[key] is not None
+    }
+
+
+def forward_probe(
+    model: nn.Module,
+    batch: dict[str, torch.Tensor],
+) -> tuple[dict[str, ProbeSnap], torch.Tensor]:
+    probe = enable_probe(model)
+    try:
+        with torch.no_grad():
+            logits = model(batch["x"], batch["edge_x"], **_forward_kwargs(batch))
+        node_mask = batch.get("node_mask", batch.get("mask"))
+        edge_mask = edge_mask_from_batch(batch, int(batch["edge_x"].size(1)))
+        snaps = parse_probe(probe, node_mask=node_mask, edge_mask=edge_mask)
+        return snaps, logits
+    finally:
+        disable_probe(model)
+
+
+def _snaps_cpu(snaps: dict[str, ProbeSnap]) -> dict[str, ProbeSnap]:
+    """Host copies so Adam steps do not pin layer states on GPU."""
+    out: dict[str, ProbeSnap] = {}
+    for stage, snap in snaps.items():
+        nm = None if snap.node_mask is None else snap.node_mask.detach().cpu()
+        em = None if snap.edge_mask is None else snap.edge_mask.detach().cpu()
+        out[stage] = ProbeSnap(
+            snap.stage,
+            snap.h_x.detach().cpu(),
+            snap.h_e.detach().cpu(),
+            nm,
+            em,
+        )
+    return out
+
+
+def snap_metrics(snaps: dict[str, ProbeSnap]) -> dict[str, dict[str, float]]:
+    rows: dict[str, dict[str, float]] = {}
+    for stage, snap in snaps.items():
+        rows[stage] = {
+            "particle": masked_msq(snap.h_x, snap.node_mask),
+            "edge": masked_msq(snap.h_e, snap.edge_mask),
+        }
+    return rows
+
+
+def delta_metrics(
+    before: dict[str, ProbeSnap],
+    after: dict[str, ProbeSnap],
+) -> dict[str, dict[str, float]]:
+    rows: dict[str, dict[str, float]] = {}
+    for stage in before:
+        if stage not in after:
+            continue
+        a, b = before[stage], after[stage]
+        rows[stage] = {
+            "particle": masked_msq(b.h_x - a.h_x, a.node_mask),
+            "edge": masked_msq(b.h_e - a.h_e, a.edge_mask),
+        }
+    return rows
+
+
+def build_stability_model(
+    family: str,
+    *,
+    depth: int,
+    width: int,
+    n_features: int,
+    n_edge_features: int,
+    heads: int = 8,
+    out_dim: int = 2,
+    seed: int = 0,
+) -> nn.Module:
+    """Construct CPEN / CAPEN / CAPEN-Llama with the jets training layout."""
+    family = family.lower().replace("_", "-")
+    torch.manual_seed(int(seed))
+    if family == "cpen":
+        from cpen.models.cpen import CPEN
+
+        return CPEN(
+            n_features=n_features,
+            n_edge_features=n_edge_features,
+            out_dim=out_dim,
+            depth=depth,
+            width=width,
+            operators="incidence",
+            normalization="energy-weights",
+            residual_structure="transformer-like",
+            operator_normalization="degree",
+            operator_backend="sparse",
+            layer_norm=True,
+            dropout=0.0,
+            optimizer="adam",
+            readout_mode="graph",
+        )
+    if family == "capen":
+        from cpen.models.capen import CAPEN
+
+        return CAPEN(
+            n_features=n_features,
+            n_edge_features=n_edge_features,
+            out_dim=out_dim,
+            depth=depth,
+            width=width,
+            heads=heads,
+            dropout=0.0,
+            optimizer="adam",
+            readout_mode="graph",
+        )
+    if family in {"capen-llama", "capenllama"}:
+        from cpen.models.capen_llama import CAPENLlama
+
+        return CAPENLlama(
+            n_features=n_features,
+            n_edge_features=n_edge_features,
+            out_dim=out_dim,
+            depth=depth,
+            width=width,
+            heads=heads,
+            dropout=0.0,
+            optimizer="adam",
+            readout_mode="graph",
+            use_wire=False,
+            all_to_all_particle_attention=True,
+        )
+    raise ValueError(f"unknown family {family!r}")
+
+
+def _ce_step(
+    model: nn.Module,
+    batch: dict[str, torch.Tensor],
+    opt: torch.optim.Optimizer,
+) -> float:
+    # Must not record probes here: each step would otherwise retain every
+    # layer's (B, M, D) edge states for the rest of the run.
+    disable_probe(model)
+    opt.zero_grad(set_to_none=True)
+    logits = model(batch["x"], batch["edge_x"], **_forward_kwargs(batch))
+    loss = F.cross_entropy(logits, batch["y"])
+    loss.backward()
+    opt.step()
+    return float(loss.detach())
+
+
+def run_one_architecture(
+    family: str,
+    *,
+    depth: int,
+    width: int,
+    batch: dict[str, torch.Tensor],
+    eta_0: float,
+    n_adam_steps: int,
+    heads: int = 8,
+    seed: int = 0,
+    device: torch.device | None = None,
+) -> pd.DataFrame:
+    """Init norms, 1-step Adam Δ, then T-step feature and cumulative Δ."""
+    device = device or batch["x"].device
+    n_features = int(batch["x"].size(-1))
+    n_edge_features = int(batch["edge_x"].size(-1))
+    model = build_stability_model(
+        family,
+        depth=depth,
+        width=width,
+        n_features=n_features,
+        n_edge_features=n_edge_features,
+        heads=heads,
+        seed=seed,
+    ).to(device)
+    model.train()
+    try:
+        return _run_one_architecture_body(
+            model,
+            family=family,
+            depth=depth,
+            width=width,
+            batch=batch,
+            eta_0=eta_0,
+            n_adam_steps=n_adam_steps,
+            heads=heads,
+            device=device,
+        )
+    finally:
+        disable_probe(model)
+        try:
+            model.cpu()
+        except Exception:
+            pass
+        del model
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def _run_one_architecture_body(
+    model: nn.Module,
+    *,
+    family: str,
+    depth: int,
+    width: int,
+    batch: dict[str, torch.Tensor],
+    eta_0: float,
+    n_adam_steps: int,
+    heads: int,
+    device: torch.device,
+) -> pd.DataFrame:
+    n_params = n_trainable(model)
+    lr = adam_lr(eta_0, width)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, eps=ADAM_EPS)
+
+    snaps0, _ = forward_probe(model, batch)
+    m0 = snap_metrics(snaps0)
+    snaps0 = _snaps_cpu(snaps0)
+    m1 = m0
+    d1 = {stage: {"particle": 0.0, "edge": 0.0} for stage in m0}
+    mt = m0
+    dt = d1
+    loss_t = float("nan")
+    n_steps = int(n_adam_steps)
+    if n_steps >= 1:
+        loss_t = _ce_step(model, batch, opt)
+        snaps1, _ = forward_probe(model, batch)
+        m1 = snap_metrics(snaps1)
+        snaps1 = _snaps_cpu(snaps1)
+        d1 = delta_metrics(snaps0, snaps1)
+        mt, dt = m1, d1
+        del snaps1
+        for _ in range(n_steps - 1):
+            loss_t = _ce_step(model, batch, opt)
+        if n_steps > 1:
+            snaps_t, _ = forward_probe(model, batch)
+            mt = snap_metrics(snaps_t)
+            dt = delta_metrics(snaps0, _snaps_cpu(snaps_t))
+            del snaps_t
+    del snaps0
+
+    rows = []
+    for stage, init in m0.items():
+        for token in ("particle", "edge"):
+            rows.append(
+                {
+                    "family": family,
+                    "depth": depth,
+                    "width": width,
+                    "heads": heads if family != "cpen" else pd.NA,
+                    "n_params": n_params,
+                    "eta_0": eta_0,
+                    "lr": lr,
+                    "n_adam_steps": int(n_adam_steps),
+                    "stage": stage,
+                    "token": token,
+                    "msq_init": init[token],
+                    "msq_1": m1.get(stage, {}).get(token, float("nan")),
+                    "dmsq_1": d1.get(stage, {}).get(token, float("nan")),
+                    "msq_T": mt.get(stage, {}).get(token, float("nan")),
+                    "dmsq_T": dt.get(stage, {}).get(token, float("nan")),
+                    "loss_T": loss_t,
+                }
+            )
+    del opt
+    return pd.DataFrame(rows)
+
+
+def run_stability_ladder(
+    batch: dict[str, torch.Tensor],
+    *,
+    families: Sequence[str] = ("cpen", "capen"),
+    archs: Sequence[tuple[int, int]] = DEFAULT_ARCHS,
+    eta_0: float = 0.25,
+    n_adam_steps: int = 100,
+    heads: int = 8,
+    seed: int = 0,
+    device: torch.device | None = None,
+    quiet: bool = False,
+) -> pd.DataFrame:
+    """Sweep families × (L, D) on a fixed batch."""
+    device = device or batch["x"].device
+    release_cuda()
+    if device.type == "cuda":
+        alloc_gib = torch.cuda.memory_allocated(device) / 2**30
+        if not quiet:
+            print(f"[stability] {cuda_mem_line()}")
+        if alloc_gib > _STALE_CUDA_GIB:
+            raise RuntimeError(
+                f"This process already has {alloc_gib:.2f} GiB allocated on CUDA "
+                f"(need a near-empty GPU for the ladder). Kernel → Restart, then "
+                f"run from the top. Leftover ipykernel PIDs from earlier OOM runs "
+                f"will also pin the device — check nvidia-smi and kill those."
+            )
+    frames: list[pd.DataFrame] = []
+    for family in families:
+        for depth, width in archs:
+            if not quiet:
+                print(f"[stability] {family:12s}  L={depth} D={width}  T={n_adam_steps}")
+            frames.append(
+                run_one_architecture(
+                    family,
+                    depth=int(depth),
+                    width=int(width),
+                    batch=batch,
+                    eta_0=eta_0,
+                    n_adam_steps=n_adam_steps,
+                    heads=heads,
+                    seed=seed,
+                    device=device,
+                )
+            )
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_jets_knn_batch(
+    data_root: str | Path,
+    *,
+    n_jets: int = 16,
+    num_particles: int = 128,
+    k: int = 8,
+    split: str = "train",
+    seed: int = 0,
+    pool: int = 4096,
+    device: torch.device | None = None,
+) -> dict[str, torch.Tensor]:
+    """Sample jets from a short HDF5 prefix, stack, and build directed kNN graphs.
+
+    ``pool`` rows are read (not the full 1.2M train split) so the notebook can
+    start without paging the whole table into RAM.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from cpen.apps.jets.toptagging import (
+        MAX_NUM_PARTICLES,
+        N_PARTICLE_FEATURES,
+        preprocess_particle_features,
+        raw_hdf5_path,
+    )
+    from cpen.graphs.graphs import build_knn_graph
+    from cpen.graphs.sparse_incidence import attach_sparse_incidence_batch
+
+    device = device or torch.device("cpu")
+    hdf5_path = raw_hdf5_path(data_root, split)
+    n_want = int(n_jets)
+    n_pool = max(int(pool), n_want)
+    table = pd.read_hdf(hdf5_path, key="table", start=0, stop=n_pool)
+    data = np.asarray(table)
+    n_avail = int(data.shape[0])
+    feat = MAX_NUM_PARTICLES * N_PARTICLE_FEATURES
+    particles = data[:, :feat].reshape(-1, MAX_NUM_PARTICLES, N_PARTICLE_FEATURES)[
+        :, : int(num_particles)
+    ]
+    labels = data[:, -1]
+    g = torch.Generator().manual_seed(int(seed))
+    n = min(n_want, n_avail)
+    perm = torch.randperm(n_avail, generator=g)[:n]
+    xs_raw, xs, masks, ys = [], [], [], []
+    for i in perm.tolist():
+        part = torch.from_numpy(particles[i].astype(np.float32))
+        x_raw, x_model, mask = preprocess_particle_features(part)
+        xs_raw.append(x_raw)
+        xs.append(x_model)
+        masks.append(mask)
+        ys.append(int(labels[i]))
+    x_raw = torch.stack(xs_raw, dim=0)
+    x = torch.stack(xs, dim=0)
+    mask = torch.stack(masks, dim=0)
+    y = torch.tensor(ys, dtype=torch.long)
+    pt = torch.hypot(x_raw[..., 1], x_raw[..., 2]) * mask.to(x_raw.dtype)
+    z = pt / pt.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    _, edge_x, incidence = build_knn_graph(x_raw, k=int(k), mask=mask)
+    batch = {
+        "x": x,
+        "x_raw": x_raw,
+        "edge_x": edge_x,
+        "incidence": incidence,
+        "mask": mask,
+        "z": z,
+        "y": y,
+    }
+    batch = attach_sparse_incidence_batch(batch)
+    return {
+        key: value.to(device) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
+
+
+def _color_cycle(n: int):
+    if hasattr(mpl, "color_sequences"):
+        cmap = mpl.color_sequences["tab10"]
+    else:
+        cmap = plt.cm.tab10.colors
+    return [cmap[i % len(cmap)] for i in range(n)]
+
+
+def last_layer_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep encoder + last residual layer for the param-axis plots."""
+    if df.empty:
+        return df
+    keep = []
+    for _, sub in df.groupby(["family", "depth", "width"], sort=False):
+        last = last_layer_stage(int(sub["depth"].iloc[0]))
+        keep.append(sub.loc[sub["stage"].isin(["encode", last])])
+    return pd.concat(keep, ignore_index=True)
+
+
+def plot_stability_vs_params(
+    df: pd.DataFrame,
+    *,
+    n_adam_steps: int | None = None,
+    figsize: tuple[float, float] | None = None,
+    stem: str | None = "jets_cpen_capen_stability",
+    fig_dir: Path | None = None,
+    show: bool = True,
+) -> plt.Figure | None:
+    """
+    Three panels vs ``#`` params: init ρ, 1-step Δρ, then ρ and Δρ after T Adam steps.
+
+    Color = family. Marker / linestyle = particle vs edge. Encoder is drawn
+    fainter than the last layer.
+    """
+    plot_df = last_layer_frame(df)
+    if plot_df.empty:
+        print("No stability rows to plot.")
+        return None
+    if n_adam_steps is None:
+        n_adam_steps = int(plot_df["n_adam_steps"].iloc[0])
+    families = list(dict.fromkeys(plot_df["family"]))
+    tokens = ("particle", "edge")
+    token_style = {
+        "particle": {"marker": "o", "ls": "-"},
+        "edge": {"marker": "s", "ls": "--"},
+    }
+    colors = dict(zip(families, _color_cycle(len(families))))
+    if figsize is None:
+        figsize = (10.2, 3.15)
+    fig, axes = plt.subplots(1, 3, figsize=figsize, dpi=200)
+
+    def _draw(ax, ycol: str, *, alpha_encode: float = 0.35) -> None:
+        for fam in families:
+            for token in tokens:
+                style = token_style[token]
+                for stage_kind, alpha in (("encode", alpha_encode), ("last", 1.0)):
+                    sub = plot_df.loc[
+                        plot_df["family"].eq(fam) & plot_df["token"].eq(token)
+                    ].copy()
+                    if stage_kind == "encode":
+                        sub = sub.loc[sub["stage"].eq("encode")]
+                    else:
+                        last = sub.apply(
+                            lambda r: r["stage"] == last_layer_stage(int(r["depth"])),
+                            axis=1,
+                        )
+                        sub = sub.loc[last]
+                    sub = sub.sort_values("n_params")
+                    if sub.empty or ycol not in sub.columns:
+                        continue
+                    label = None
+                    if stage_kind == "last":
+                        label = f"{fam}, {token}"
+                    ax.plot(
+                        sub["n_params"],
+                        sub[ycol],
+                        color=colors[fam],
+                        alpha=alpha,
+                        label=label,
+                        **style,
+                    )
+
+    _draw(axes[0], "msq_init")
+    _draw(axes[1], "dmsq_1")
+    # After T steps: last-layer ρ (solid-ish) and cumulative Δρ (same style, lower alpha via second call).
+    _draw(axes[2], "msq_T", alpha_encode=0.25)
+    for fam in families:
+        for token in tokens:
+            style = token_style[token]
+            sub = plot_df.loc[
+                plot_df["family"].eq(fam)
+                & plot_df["token"].eq(token)
+                & plot_df.apply(
+                    lambda r: r["stage"] == last_layer_stage(int(r["depth"])),
+                    axis=1,
+                )
+            ].sort_values("n_params")
+            if sub.empty:
+                continue
+            axes[2].plot(
+                sub["n_params"],
+                sub["dmsq_T"],
+                color=colors[fam],
+                alpha=0.45,
+                marker=style["marker"],
+                ls=":",
+                label=f"{fam}, {token} Δ",
+            )
+
+    axes[0].set_ylabel(r"$\|Z\|_F^2/(N_t D)$")
+    axes[0].set_title("Init")
+    axes[1].set_ylabel(r"$\|\Delta Z\|_F^2/(N_t D)$")
+    axes[1].set_title("After 1 Adam step")
+    axes[2].set_ylabel(r"$\|Z\|_F^2$ and $\|\Delta Z_{0\to T}\|_F^2$ $/(N_t D)$")
+    axes[2].set_title(rf"After $T={n_adam_steps}$ Adam steps")
+    axes[1].set_yscale("log")
+    axes[2].set_yscale("log")
+    for ax in axes:
+        ax.set_xscale("log")
+        ax.set_xlabel(r"$\#$ params")
+        ax.legend(fontsize=6, loc="best")
+    fig.tight_layout()
+    if stem:
+        savefig(fig, stem, fig_dir=fig_dir or DEFAULT_FIG_DIR)
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_layerwise_msq(
+    df: pd.DataFrame,
+    *,
+    depth: int,
+    width: int,
+    ycol: str = "msq_init",
+    stem: str | None = None,
+    fig_dir: Path | None = None,
+    show: bool = True,
+) -> plt.Figure | None:
+    """ρ vs layer index at one architecture (sanity that depth does not explode)."""
+    sub = df.loc[df["depth"].eq(depth) & df["width"].eq(width)].copy()
+    if sub.empty:
+        print(f"No rows for L={depth}, D={width}.")
+        return None
+
+    def _layer_idx(stage: str) -> int:
+        if stage == "encode":
+            return 0
+        if stage.startswith("layer"):
+            return int(stage.replace("layer", "")) + 1
+        return -1
+
+    sub["ell"] = sub["stage"].map(_layer_idx)
+    sub = sub.loc[sub["ell"] >= 0].sort_values("ell")
+    families = list(dict.fromkeys(sub["family"]))
+    colors = dict(zip(families, _color_cycle(len(families))))
+    fig, ax = plt.subplots(figsize=(4.2, 3.0), dpi=200)
+    for fam in families:
+        for token, ls, marker in (("particle", "-", "o"), ("edge", "--", "s")):
+            sw = sub.loc[sub["family"].eq(fam) & sub["token"].eq(token)]
+            if sw.empty:
+                continue
+            ax.plot(
+                sw["ell"],
+                sw[ycol],
+                ls=ls,
+                marker=marker,
+                color=colors[fam],
+                label=f"{fam}, {token}",
+            )
+    ax.set_xlabel(r"layer ($\ell=0$ is the encoder)")
+    ylabel = {
+        "msq_init": r"init $\|Z\|_F^2/(N_t D)$",
+        "dmsq_1": r"1-step $\|\Delta Z\|_F^2/(N_t D)$",
+        "msq_T": r"after $T$ $\|Z\|_F^2/(N_t D)$",
+        "dmsq_T": r"after $T$ $\|\Delta Z\|_F^2/(N_t D)$",
+    }.get(ycol, ycol)
+    ax.set_ylabel(ylabel)
+    ax.set_title(rf"$L={depth}$, $D={width}$")
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    if stem:
+        savefig(fig, stem, fig_dir=fig_dir or DEFAULT_FIG_DIR)
+    if show:
+        plt.show()
+    return fig
