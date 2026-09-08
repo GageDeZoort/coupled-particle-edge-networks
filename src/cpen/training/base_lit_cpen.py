@@ -219,7 +219,19 @@ class BaseLitCPEN(L.LightningModule):
         if "x_raw" in batch:
             x_raw = batch.pop("x_raw")
             mask = batch["mask"]
-            if self.live_graph_k is not None:
+            if self.live_star_radius is not None:
+                from cpen.graphs.graph_star import build_star_radius_graph
+
+                edge_x, incidence, _ = build_star_radius_graph(
+                    x_raw,
+                    radius=float(self.live_star_radius),
+                    mask=mask,
+                    edge_features=self.live_edge_features,
+                    centroid_weight=self.live_centroid_weight,
+                )
+                batch["edge_x"] = edge_x
+                batch["incidence"] = incidence
+            elif self.live_graph_k is not None:
                 _, edge_x, incidence = build_knn_graph(x_raw, k=self.live_graph_k, mask=mask)
                 batch["edge_x"] = edge_x
                 batch["incidence"] = incidence
