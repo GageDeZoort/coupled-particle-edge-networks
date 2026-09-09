@@ -31,8 +31,7 @@ class TopTaggingStarDatamodule(BaseDatamodule):
     """
 
     DEFAULT_N_PARTICLES = DEFAULT_NUM_PARTICLES
-    # ParT TopLandscape kin (7-D); edge features stay Lorentz-derived from
-    # raw four-vectors.
+    # ParT TopLandscape / JetClass_kin (7-D, affine only — no row-L2).
     N_FEATURES = N_PART_KIN_FEATURES
     N_EDGE_FEATURES = 4
     OUT_DIM = 2

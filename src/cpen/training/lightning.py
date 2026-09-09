@@ -158,6 +158,22 @@ def resolve_precision(*, n_gpus: int, precision: str | None) -> PrecisionSetting
     return "bf16-mixed" if n_gpus > 0 else "32-true"
 
 
+def last_checkpoint_callback(
+    run_dir: Path, *, every_n_train_steps: int | None = None
+) -> ModelCheckpoint:
+    """``last.ckpt`` at epoch end, and optionally every ``N`` optimizer steps."""
+    kwargs: dict[str, Any] = {
+        "dirpath": run_dir,
+        "filename": "last",
+        "save_last": True,
+    }
+    if every_n_train_steps is not None and int(every_n_train_steps) > 0:
+        kwargs["every_n_train_steps"] = int(every_n_train_steps)
+    else:
+        kwargs["every_n_epochs"] = 1
+    return ModelCheckpoint(**kwargs)
+
+
 def build_trainer(
     run_dir: Path,
     parquet_path: Path,
@@ -174,6 +190,7 @@ def build_trainer(
     limit_val_batches: float | int | None = None,
     checkpoint_monitor: str = "val_loss",
     checkpoint_mode: str = "min",
+    checkpoint_every_n_steps: int | None = None,
 ) -> L.Trainer:
     """Create a Lightning trainer with DDP, parquet logging, and resume checkpoints."""
     use_gpu = n_gpus > 0
@@ -200,6 +217,10 @@ def build_trainer(
             parquet_metadata["float32_matmul_precision"] = matmul_precision
         if log_every_n_steps is not None and log_every_n_steps > 0:
             parquet_metadata["log_every_n_steps"] = log_every_n_steps
+        if checkpoint_every_n_steps is not None:
+            parquet_metadata["checkpoint_every_n_steps"] = int(
+                checkpoint_every_n_steps
+            )
 
     run_dir.mkdir(parents=True, exist_ok=True)
     callbacks = [
@@ -209,11 +230,8 @@ def build_trainer(
             metadata=parquet_metadata or {},
             log_every_n_steps=log_every_n_steps,
         ),
-        ModelCheckpoint(
-            dirpath=run_dir,
-            filename="last",
-            save_last=True,
-            every_n_epochs=1,
+        last_checkpoint_callback(
+            run_dir, every_n_train_steps=checkpoint_every_n_steps
         ),
         ModelCheckpoint(
             dirpath=run_dir,
@@ -243,6 +261,9 @@ def build_trainer(
         trainer_kwargs["val_check_interval"] = val_check_interval
     if limit_val_batches is not None:
         trainer_kwargs["limit_val_batches"] = limit_val_batches
+    if checkpoint_every_n_steps is not None and int(checkpoint_every_n_steps) > 0:
+        # Recreate the stream loader after resume so skip-ahead sees global_step.
+        trainer_kwargs["reload_dataloaders_every_n_epochs"] = 1
     return L.Trainer(**trainer_kwargs)
 
 

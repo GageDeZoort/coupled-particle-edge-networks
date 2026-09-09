@@ -77,6 +77,16 @@ SPLIT_DIRS: dict[str, str] = {
     "test": "test_20M",
 }
 
+#: Jets per contiguous ROOT read. The branches sit in ~200-entry baskets, so
+#: this is not about basket alignment: it amortizes the fixed per-call cost of
+#: ``uproot.arrays`` over the 17 branches. A worker holds one chunk per class,
+#: so this also sets the resident set: ~0.55 GB at 128 particles, full features.
+DEFAULT_CHUNK_SIZE = 5_000
+
+#: Jets held per worker for shuffling. Arrivals are already class round-robin,
+#: so this only has to break the within-class file ordering.
+DEFAULT_SHUFFLE_BUFFER = 20_000
+
 #: Files per class per split, and jets per file. The published JetClass release
 #: is uniform: 100k jets per file, 100/5/20 files per class.
 FILES_PER_CLASS: dict[str, int] = {"train": 100, "val": 5, "test": 20}
@@ -84,8 +94,12 @@ JETS_PER_FILE = 100_000
 
 #: Input configurations from the scaling-law study, as subsets of the 17 ParT
 #: features so that every configuration shares one standardization convention.
-#: ``kin`` is the reference "kinematic variables only" arm
-#: $(\\Delta\\eta, \\Delta\\phi, \\log p_T)$.
+#:
+#: ``kin7`` is the Particle Transformer *transfer* recipe: the same seven
+#: channels as ``JetClass_kin.yaml`` / ``top_kin.yaml`` (affine only; no
+#: row-\(L^2\)). Use this when pretraining on JetClass for TopTagging finetune.
+#: ``kin`` is a smaller 3-D ablation \((\\Delta\\eta, \\Delta\\phi, \\log p_T)\),
+#: not the ParT ``kin`` yaml.
 FEATURE_CONFIGS: dict[str, tuple[str, ...]] = {
     "full": tuple(PART_FEATURE_NAMES),
     "kin": ("part_deta", "part_dphi", "part_pt_log"),
@@ -259,7 +273,7 @@ def plan_shards(
     split: str,
     *,
     n_jets: int | None,
-    chunk_size: int = 20_000,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> list[Shard]:
     """
     Class-balanced read plan.
@@ -290,19 +304,122 @@ def plan_shards(
                 remaining -= take
         per_class_lists.append(shards)
 
-    # Round-robin across classes so any prefix of the plan is class balanced.
+    return _interleave_classes(per_class_lists)
+
+
+def _interleave_classes(per_class_lists: list[list[Shard]]) -> list[Shard]:
+    """Round-robin across classes so any prefix of the plan is class balanced."""
     interleaved: list[Shard] = []
-    for i in range(max(len(s) for s in per_class_lists)):
+    depth = max((len(s) for s in per_class_lists), default=0)
+    for i in range(depth):
         for shards in per_class_lists:
             if i < len(shards):
                 interleaved.append(shards[i])
     return interleaved
 
 
+def split_plan_over_workers(
+    shards: Sequence[Shard], worker_id: int, num_workers: int
+) -> list[Shard]:
+    """
+    One worker's slice of the plan, keeping every class in every worker.
+
+    Striding the interleaved plan directly (``shards[id::num_workers]``) aliases
+    with the class cycle whenever ``gcd(num_workers, N_CLASSES) > 1``: with six
+    workers a worker would only ever see the five even labels. Dealing out each
+    class's shards separately and re-interleaving keeps all ten labels, and the
+    prefix of each worker's stream class balanced.
+    """
+    if num_workers <= 1:
+        return list(shards)
+    per_class: list[list[Shard]] = [[] for _ in range(N_CLASSES)]
+    for shard in shards:
+        per_class[shard.label].append(shard)
+    return _interleave_classes(
+        [shards_of_class[worker_id::num_workers] for shards_of_class in per_class]
+    )
+
+
+def chunk_size_for_workers(n_jets: int | None, num_workers: int) -> int:
+    """
+    Largest chunk size that still gives every worker a shard of every class.
+
+    Workers are dealt each class's shards round-robin, so a class with fewer
+    shards than workers leaves some workers without it and their batches
+    class-imbalanced. Shrinking the chunk raises the shard count per class.
+    """
+    workers = max(1, num_workers)
+    if n_jets is None:
+        per_class = FILES_PER_CLASS["train"] * JETS_PER_FILE
+    else:
+        per_class = _per_class_quota(n_jets, N_CLASSES - 1)
+    return max(1, min(DEFAULT_CHUNK_SIZE, per_class // workers))
+
+
 def _per_class_quota(n_jets: int, label: int) -> int:
     """Split ``n_jets`` over ten classes, giving the remainder to low labels."""
     base, extra = divmod(n_jets, N_CLASSES)
     return base + (1 if label < extra else 0)
+
+
+def skip_jets_for_worker(skip_jets: int, *, worker_id: int, num_workers: int) -> int:
+    """Split a global skip count across DataLoader workers, remainder first."""
+    skip_jets = max(0, int(skip_jets))
+    workers = max(1, int(num_workers))
+    if workers == 1:
+        return skip_jets
+    base, rem = divmod(skip_jets, workers)
+    return base + (1 if worker_id < rem else 0)
+
+
+def _trim_class_shards(shards: list[Shard], n_jets: int) -> list[Shard]:
+    """Drop the first ``n_jets`` jets from one class's ordered shard list."""
+    remaining = max(0, int(n_jets))
+    out = list(shards)
+    while remaining > 0 and out:
+        shard = out[0]
+        if shard.n_jets <= remaining:
+            remaining -= shard.n_jets
+            out.pop(0)
+            continue
+        out[0] = Shard(
+            shard.path, shard.label, shard.entry_start + remaining, shard.entry_stop
+        )
+        remaining = 0
+    return out
+
+
+def skip_round_robin_shards(shards: Sequence[Shard], n_skip: int) -> list[Shard]:
+    """
+    Advance a class-interleaved plan by ``n_skip`` jets without reading ROOT.
+
+    Matches ``_stream_jets`` emission order: one jet from each still-active
+    class per cycle. Used to resume a stream after ``last.ckpt``.
+    """
+    pending: list[list[Shard]] = [[] for _ in range(N_CLASSES)]
+    for shard in shards:
+        pending[shard.label].append(shard)
+    remaining = max(0, int(n_skip))
+    while remaining > 0:
+        active = [label for label in range(N_CLASSES) if pending[label]]
+        if not active:
+            break
+        n_active = len(active)
+        per_class, leftover = divmod(remaining, n_active)
+        if per_class:
+            take = min(per_class, min(sum(s.n_jets for s in pending[i]) for i in active))
+            take = max(1, take)
+            for label in active:
+                pending[label] = _trim_class_shards(pending[label], take)
+            remaining -= take * n_active
+            continue
+        for label in active[:leftover]:
+            pending[label] = _trim_class_shards(pending[label], 1)
+        remaining = 0
+    out: list[Shard] = []
+    for group in pending:
+        out.extend(group)
+    return out
 
 
 def read_shard(
@@ -382,10 +499,12 @@ class JetClassStreamDataset(IterableDataset):
     Single-pass, class-interleaved stream over raw JetClass ROOT files.
 
     For the compute-optimal regime, where every jet is seen exactly once. Shards
-    are distributed across DataLoader workers, and each worker shuffles within a
-    buffer so batches mix classes without ever holding the split in memory.
+    are distributed across DataLoader workers, and each worker holds one open
+    chunk per class and emits round-robin over them, so every batch is class
+    balanced without ever holding the split in memory. A shuffle buffer on top
+    breaks the within-class file ordering.
 
-    ``shuffle_seed`` permutes the shard order (not the class-balanced plan
+    ``shuffle_seed`` varies the emission order (not the class-balanced plan
     itself), so the set of jets seen for a given ``n_jets`` is reproducible
     while their order varies.
     """
@@ -398,18 +517,21 @@ class JetClassStreamDataset(IterableDataset):
         n_jets: int | None = None,
         num_particles: int = 128,
         feature_config: str = DEFAULT_FEATURE_CONFIG,
-        chunk_size: int = 20_000,
-        shuffle_buffer: int = 50_000,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        shuffle_buffer: int = DEFAULT_SHUFFLE_BUFFER,
         shuffle_seed: int = 0,
         sort_by_pt: bool = False,
+        skip_jets: int = 0,
     ) -> None:
         self.data_root = Path(data_root)
         self.split = split
         self.num_particles = num_particles
         self.feature_config = feature_config
+        self.chunk_size = chunk_size
         self.shuffle_buffer = shuffle_buffer
         self.shuffle_seed = shuffle_seed
         self.sort_by_pt = sort_by_pt
+        self.skip_jets = max(0, int(skip_jets))
         self.shards = plan_shards(
             data_root, split, n_jets=n_jets, chunk_size=chunk_size
         )
@@ -419,29 +541,75 @@ class JetClassStreamDataset(IterableDataset):
         return self.n_jets
 
     def _worker_shards(self) -> list[Shard]:
-        """Interleaved slice of the plan for this worker, preserving class balance."""
+        """Slice of the plan for this worker, preserving class balance."""
         info = get_worker_info()
         if info is None:
             return list(self.shards)
-        return list(self.shards[info.id :: info.num_workers])
+        return split_plan_over_workers(self.shards, info.id, info.num_workers)
+
+    def _read_shard_jets(self, shard: Shard) -> list[dict[str, torch.Tensor]]:
+        chunk = read_shard(
+            shard,
+            num_particles=self.num_particles,
+            feature_config=self.feature_config,
+            sort_by_pt=self.sort_by_pt,
+        )
+        tensors = {k: torch.from_numpy(v) for k, v in chunk.items()}
+        return [{k: v[i] for k, v in tensors.items()} for i in range(shard.n_jets)]
+
+    def _stream_jets(self, shards: Sequence[Shard]) -> Iterator[dict[str, torch.Tensor]]:
+        """
+        Jets in class round-robin order, one open chunk per class.
+
+        Interleaving has to happen at jet granularity rather than shard
+        granularity. A shard holds ``chunk_size`` jets of a single class, so a
+        shuffle buffer would have to span a whole class cycle to undo that block
+        structure, and even then arrivals leak: a jet inserted into a reservoir
+        can be drawn again immediately, so a block of one class raises that
+        class's share of the next few thousand emissions. Cycling per-class
+        cursors makes every window of ``N_CLASSES`` jets exactly balanced.
+        """
+        pending: list[list[Shard]] = [[] for _ in range(N_CLASSES)]
+        for shard in shards:
+            pending[shard.label].append(shard)
+        cursors: dict[int, Iterator[dict[str, torch.Tensor]]] = {}
+        active = [label for label in range(N_CLASSES) if pending[label]]
+        for label in active:
+            cursors[label] = iter(self._read_shard_jets(pending[label].pop(0)))
+
+        while active:
+            still_active: list[int] = []
+            for label in active:
+                jet = next(cursors[label], None)
+                if jet is None:
+                    if not pending[label]:
+                        continue
+                    cursors[label] = iter(
+                        self._read_shard_jets(pending[label].pop(0))
+                    )
+                    jet = next(cursors[label], None)
+                    if jet is None:
+                        continue
+                yield jet
+                still_active.append(label)
+            active = still_active
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        shards = self._worker_shards()
         info = get_worker_info()
         seed = self.shuffle_seed + (0 if info is None else info.id)
         rng = np.random.default_rng(seed)
+        n_workers = 1 if info is None else info.num_workers
+        worker_id = 0 if info is None else info.id
+        worker_skip = skip_jets_for_worker(
+            self.skip_jets, worker_id=worker_id, num_workers=n_workers
+        )
+        shards = skip_round_robin_shards(self._worker_shards(), worker_skip)
 
+        # Arrivals are already class-balanced, so the buffer only has to break
+        # the within-class file ordering; it is emitted in permuted blocks.
         buffer: list[dict[str, torch.Tensor]] = []
-        for shard in shards:
-            chunk = read_shard(
-                shard,
-                num_particles=self.num_particles,
-                feature_config=self.feature_config,
-                sort_by_pt=self.sort_by_pt,
-            )
-            tensors = {k: torch.from_numpy(v) for k, v in chunk.items()}
-            for i in range(shard.n_jets):
-                buffer.append({k: v[i] for k, v in tensors.items()})
+        for jet in self._stream_jets(shards):
+            buffer.append(jet)
             if len(buffer) >= self.shuffle_buffer:
                 for index in rng.permutation(len(buffer)):
                     yield buffer[index]

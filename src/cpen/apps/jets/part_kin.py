@@ -1,17 +1,26 @@
-"""ParT TopLandscape ``kin`` particle features from raw four-vectors.
+r"""ParT kinematic (``kin``) particle features from raw four-vectors.
 
-Matches ``utils/convert_top_datasets.py`` + ``data/TopLandscape/top_kin.yaml``
-in https://github.com/jet-universe/particle_transformer:
+Mirrors the Particle Transformer transfer recipe
+(https://github.com/jet-universe/particle_transformer):
+
+- JetClass pretrain for TopLandscape uses ``data/JetClass/JetClass_kin.yaml``
+- TopLandscape finetune uses ``data/TopLandscape/top_kin.yaml``
+- Both expose the same seven ``pf_features`` with the same manual affine
+  standardization and **no** row-\(L^2\) (Weaver ``preprocess.method: manual``)
+
+TopTagging conversion matches ``utils/convert_top_datasets.py`` (TopLandscape
+only ships 4-vectors):
 
 - Jet axis = sum of constituent four-vectors
 - ``part_deta = (η − η_J) * sign(η_J)`` (sign 0 → +1)
 - ``part_dphi`` = wrapped Δφ to the jet
-- Seven pf_features with the same manual standardization as ``top_kin.yaml``
 
 Constituent layout is this repo's ``[E, px, py, pz]``. Pads (pT == 0) are
-zeroed in the returned features. After ParT standardization, each particle
-row is L2-scaled so ``||x||^2 = 7``. ``z`` (pT fraction) is kept separately
-for energy-weight pooling and is not a model input feature.
+zeroed. ``z`` (pT fraction) is kept separately for energy-weight pooling and
+is not a model input feature.
+
+Optional ``l2_normalize=True`` restores an older CPEN ablation that L2-scales
+each particle row to ``||x||^2 = 7``; that step is **not** part of ParT.
 """
 
 from __future__ import annotations
@@ -20,7 +29,7 @@ import torch
 
 from cpen.utils.graphs import scale_features_l2_sqrt_dim
 
-# ParT TopLandscape pf_features order (top_kin.yaml).
+# ParT TopLandscape / JetClass_kin pf_features order (top_kin.yaml).
 PART_KIN_FEATURE_NAMES = (
     "part_pt_log",
     "part_e_log",
@@ -31,7 +40,7 @@ PART_KIN_FEATURE_NAMES = (
     "part_dphi",
 )
 N_PART_KIN_FEATURES = len(PART_KIN_FEATURE_NAMES)
-PARTICLE_NORMALIZATION = "part-kin-l2-sqrt-dim"
+PARTICLE_NORMALIZATION = "part-kin-affine"
 
 # ParT pairwise interaction features (Qu, Li, Qian 2022, eq. 3). Used as
 # *edge inputs*, not as an attention-logit bias. Order matches the paper:
@@ -94,13 +103,15 @@ def build_part_kin_features(
     mask: torch.Tensor | None = None,
     *,
     eps: float = 1e-12,
+    l2_normalize: bool = False,
 ) -> torch.Tensor:
-    """
+    r"""
     ParT-kin features ``(N, 7)`` or ``(B, N, 7)`` from ``[E, px, py, pz]``.
 
     Padded slots (mask False / pT≈0) are all-zero rows. Features follow
-    ``PART_KIN_FEATURE_NAMES`` with ``top_kin.yaml`` standardization, then
-    per-particle L2 scaling so ``||x||^2 = 7``.
+    ``PART_KIN_FEATURE_NAMES`` with ``top_kin.yaml`` / ``JetClass_kin.yaml``
+    affine standardization. Row-\(L^2\) is off by default (ParT/Weaver); pass
+    ``l2_normalize=True`` only for the legacy CPEN ablation.
     """
     single = constituents.dim() == 2
     if single:
@@ -162,7 +173,8 @@ def build_part_kin_features(
     }
     feats = [_standardize(name, raw_by_name[name]) for name in PART_KIN_FEATURE_NAMES]
     features = torch.stack(feats, dim=-1) * valid.unsqueeze(-1)
-    features = scale_features_l2_sqrt_dim(features, eps=eps, mask=mask)
+    if l2_normalize:
+        features = scale_features_l2_sqrt_dim(features, eps=eps, mask=mask)
     features = features.to(input_dtype)
     if single:
         features = features.squeeze(0)

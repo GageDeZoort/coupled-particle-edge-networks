@@ -8,7 +8,7 @@ lost in a restore). This module loads that bytecode and wraps:
 * ``add_common_args`` / ``configure_graph_args`` for ``--knn-min-pt``, which
   rewrites ``--graph-construction 8-NN`` into ``8-NN@pt1`` (etc.)
 * defaults ``--heavy-metrics-frac`` to ``0`` (ROC AUC / bg rejection every val)
-* optional ``--val-check-interval`` passed through to Lightning
+* optional ``--val-check-interval`` / ``--checkpoint-every-n-steps`` passed through to Lightning
 * ``build_model`` forwards ``--dropout`` into CPEN MLP residuals
 * stream obvious-star mask re-partition (``--stream-mask-seed``)
 * ``--include-real-streams`` to train on non-MOCK ``stream_*.pt`` as well
@@ -17,7 +17,7 @@ lost in a restore). This module loads that bytecode and wraps:
 * ``--incidence-m22`` replaces it with linear ``f_22 = S S^T h_e`` (no ``M×M`` attn)
 * ``--hyperedge-only`` drops all pairwise 2-edges (kNN, vn_link, deg≤2) at train time
 * ``capen-llama-att`` + hierarchical TopTagging caches (``--hier-k`` …)
-* attention ``γ_rs`` estimated from the train cache before each fit
+* attention ``γ_rs`` estimated from the first train batches before each fit
   (``--attention-normalization gamma``; opt out with ``--no-estimate-gamma-rs``)
 """
 
@@ -70,6 +70,12 @@ _checkpoint_monitor_ctx: contextvars.ContextVar[str | None] = contextvars.Contex
 )
 _checkpoint_mode_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "cpen_checkpoint_mode", default=None
+)
+_checkpoint_every_n_steps_ctx: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "cpen_checkpoint_every_n_steps", default=None
+)
+_datamodule_factory_ctx: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "cpen_datamodule_factory", default=None
 )
 
 
@@ -266,8 +272,8 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         dest="estimate_gamma_rs",
         action="store_false",
         help=(
-            "Do not estimate gamma_{rs} from the cache; use explicit "
-            "--gamma-11/12/21/22 instead."
+            "Do not estimate gamma_{rs} from the first train batches; use "
+            "explicit --gamma-11/12/21/22 instead."
         ),
     )
     parser.add_argument(
@@ -332,10 +338,9 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         choices=("full", "kin", "kin7"),
         help=(
             "Particle input configuration: 'full' = 17 ParT features, "
-            "'kin' = (delta_eta, delta_phi, log pT) only, 'kin7' = the 7 ParT "
-            "kinematic features. Reproduces the input-feature ablation, which "
-            "moves the asymptotic loss rather than the scaling exponent. "
-            "Default: full."
+            "'kin7' = ParT JetClass_kin / top_kin transfer recipe (7 kinematic "
+            "features, affine only), 'kin' = 3-D ablation (delta_eta, delta_phi, "
+            "log pT). For JetClass→TopTagging transfer use kin7. Default: full."
         ),
     )
     parser.add_argument(
@@ -448,6 +453,16 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         choices=("min", "max"),
         help=(
             "min/max for --checkpoint-monitor. Default: min for *loss*, else max."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-every-n-steps",
+        type=int,
+        default=None,
+        help=(
+            "Write last.ckpt every N optimizer steps (and still at epoch end). "
+            "Default: epoch-end only. Use this for multi-hour epochs so a "
+            "preempted job can resume without replaying the stream."
         ),
     )
     parser.add_argument(
@@ -924,7 +939,7 @@ def _attention_gammas_from_args(args):  # type: ignore[no-untyped-def]
     if gammas is None:
         raise ValueError(
             "attention_normalization='gamma' requires --estimate-gamma-rs "
-            "with a graph cache, or explicit --gamma-11/12/21/22"
+            "(first train batches) or explicit --gamma-11/12/21/22"
         )
     return gammas
 
@@ -964,12 +979,13 @@ def _log_attention_gammas(gammas, summaries, *, extra: str = "") -> None:  # typ
 
 
 def resolve_attention_gammas(args, data_root):  # type: ignore[no-untyped-def]
-    """Estimate CAPEN attention γ from the train cache unless opted out.
+    """Estimate CAPEN attention γ from the first train batches unless opted out.
 
-    Hierarchical + CAPEN-Llama-att uses all-to-all ``M_{11}``, incidence
-    ``M_{12}/M_{21}``, hyperedge-only ``M_{22}``, and drops pairwise 2-edges
-    when ``--hyperedge-only``. Values are written back onto ``args`` so the
-    Slurm banner and parquet metadata record what was actually used.
+    Uses the run's ``datamodule_factory`` (live star/kNN graphs or cached
+    incidence). Hierarchical + CAPEN-Llama-att still uses all-to-all ``M_{11}``,
+    hyperedge-only ``M_{22}``, and drops pairwise 2-edges when
+    ``--hyperedge-only``. Values are written back onto ``args`` so the Slurm
+    banner and parquet metadata record what was actually used.
     """
     if getattr(args, "attention_normalization", "none") != "gamma":
         return None
@@ -986,59 +1002,47 @@ def resolve_attention_gammas(args, data_root):  # type: ignore[no-untyped-def]
     if not estimate:
         return _orig_resolve_attention_gammas(args, data_root=data_root)
 
-    from cpen.utils.attention_temperature import (
-        estimate_attention_gammas_from_cache,
-        estimate_attention_gammas_from_hier_cache,
-    )
+    from cpen.utils.attention_temperature import estimate_attention_gammas_from_datamodule
 
     all_to_all = _attention_all_to_all_m11(args)
     hyperedge_m22 = str(getattr(args, "model", "") or "") == _CAPEN_LLAMA_ATT
     drop_pairwise = bool(getattr(args, "hyperedge_only", False))
     n_jets = int(getattr(args, "gamma_estimate_jets", 512) or 512)
-    seed = int(getattr(args, "data_seed", 42) or 42)
-    num_particles = int(getattr(args, "num_particles", 128))
-    summaries = None
+    live = jetclass_live_graph_kwargs(args)
+    live_star = live.get("live_star_radius")
+    if live_star is None:
+        live_star = getattr(args, "star_radius", None)
+    live_k = getattr(args, "live_graph_k", None)
     extra = (
         f"n_jets={n_jets} all_to_all_M11={all_to_all} "
-        f"hyperedge_M22={hyperedge_m22} drop_pairwise={drop_pairwise}"
+        f"hyperedge_M22={hyperedge_m22} drop_pairwise={drop_pairwise} "
+        f"source=train-batches"
     )
+    factory = _datamodule_factory_ctx.get()
+    if factory is None:
+        raise RuntimeError(
+            "attention γ estimation needs the train datamodule from train_one_run; "
+            "pass explicit --gamma-11/12/21/22 or --no-estimate-gamma-rs"
+        )
+    print(f"[attn-gamma] estimating from first train batches  {extra}", flush=True)
     try:
-        if _hier_args_active(args):
-            print(f"[attn-gamma] estimating from hierarchical cache  {extra}", flush=True)
-            gammas, summaries = estimate_attention_gammas_from_hier_cache(
-                data_root=data_root,
-                split="train",
-                k=int(getattr(args, "hier_k") or 8),
-                eps=float(getattr(args, "hier_eps", 0.08)),
-                min_samples=int(getattr(args, "hier_min_samples", 2)),
-                n_virtual_nodes=int(getattr(args, "hier_vn", 1)),
-                n_virtual_edges=int(getattr(args, "hier_ve", 1)),
-                max_dbscan_edges=int(getattr(args, "hier_mdb", 32)),
-                num_particles=num_particles,
-                n_jets=n_jets,
-                seed=seed,
-                all_to_all_particle_attention=all_to_all,
-                hyperedge_m22_only=hyperedge_m22,
-                drop_pairwise_edges=drop_pairwise,
-            )
-        else:
-            print(f"[attn-gamma] estimating from star/kNN cache  {extra}", flush=True)
-            radius = getattr(args, "star_radius", None)
-            result = estimate_attention_gammas_from_cache(
-                data_root=data_root,
-                split="train",
-                num_particles=num_particles,
-                n_jets=n_jets,
-                seed=seed,
-                radius=radius,
-                graph_construction=None if radius is not None else getattr(args, "graph_construction", None),
-                all_to_all_particle_attention=all_to_all,
-            )
-            if isinstance(result, tuple):
-                gammas, summaries = result
-            else:
-                gammas, summaries = result, None
-    except FileNotFoundError as exc:
+        gammas, summaries = estimate_attention_gammas_from_datamodule(
+            factory(),
+            max_jets=n_jets,
+            all_to_all_particle_attention=all_to_all,
+            hyperedge_m22_only=hyperedge_m22,
+            drop_pairwise_edges=drop_pairwise,
+            live_star_radius=float(live_star) if live_star is not None else None,
+            live_graph_k=int(live_k) if live_k is not None else None,
+            live_edge_features=str(
+                live.get("live_edge_features")
+                or getattr(args, "jetclass_edge_features", "logdot-dp")
+                or "logdot-dp"
+            ),
+            live_centroid_weight=live.get("live_centroid_weight")
+            or getattr(args, "jetclass_centroid_weight", None),
+        )
+    except Exception as exc:
         has_cli = all(
             getattr(args, name, None) is not None
             for name in ("gamma_11", "gamma_12", "gamma_21", "gamma_22")
@@ -1046,7 +1050,7 @@ def resolve_attention_gammas(args, data_root):  # type: ignore[no-untyped-def]
         if not has_cli:
             raise
         print(
-            f"[attn-gamma] cache estimate failed ({exc}); using CLI --gamma-*",
+            f"[attn-gamma] batch estimate failed ({exc}); using CLI --gamma-*",
             flush=True,
         )
         args.gamma_estimated = False
@@ -1100,7 +1104,22 @@ def build_trainer(*args, **kwargs):  # type: ignore[no-untyped-def]
         mode = _checkpoint_mode_ctx.get()
         if mode is not None:
             kwargs["checkpoint_mode"] = mode
+    if "checkpoint_every_n_steps" not in kwargs:
+        every = _checkpoint_every_n_steps_ctx.get()
+        if every is not None:
+            kwargs["checkpoint_every_n_steps"] = every
     return _orig_build_trainer(*args, **kwargs)
+
+
+def _datamodule_callable_from_kwargs(kwargs: dict) -> object | None:
+    """Bytecode ``train_one_run`` receives an already-built ``datamodule``."""
+    factory = kwargs.get("datamodule_factory")
+    if factory is not None:
+        return factory
+    datamodule = kwargs.get("datamodule")
+    if datamodule is not None:
+        return lambda: datamodule
+    return None
 
 
 def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
@@ -1115,9 +1134,15 @@ def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
     else:
         vci = int(raw) if float(raw).is_integer() and float(raw) >= 1.0 else float(raw)
     monitor, mode = _resolve_checkpoint_settings(args)
+    raw_ckpt_steps = getattr(args, "checkpoint_every_n_steps", None)
+    ckpt_steps = int(raw_ckpt_steps) if raw_ckpt_steps else None
+    if ckpt_steps is not None and ckpt_steps <= 0:
+        ckpt_steps = None
     token_vci = _val_check_interval_ctx.set(vci)
     token_mon = _checkpoint_monitor_ctx.set(monitor)
     token_mode = _checkpoint_mode_ctx.set(mode)
+    token_ckpt_steps = _checkpoint_every_n_steps_ctx.set(ckpt_steps)
+    token_dm = _datamodule_factory_ctx.set(_datamodule_callable_from_kwargs(kwargs))
     # Bytecode only resolves attention γ for capen / capen-llama. Fill args
     # before build_model so capen-llama-att does not float(None).
     if (
@@ -1144,6 +1169,8 @@ def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
         _val_check_interval_ctx.reset(token_vci)
         _checkpoint_monitor_ctx.reset(token_mon)
         _checkpoint_mode_ctx.reset(token_mode)
+        _checkpoint_every_n_steps_ctx.reset(token_ckpt_steps)
+        _datamodule_factory_ctx.reset(token_dm)
 
 
 # Ensure in-module callers see the wrapped helpers.

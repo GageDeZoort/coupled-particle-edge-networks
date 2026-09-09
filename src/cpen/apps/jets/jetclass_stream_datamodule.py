@@ -11,8 +11,10 @@ from cpen.apps.jets.jetclass_stream import (
     DEFAULT_FEATURE_CONFIG,
     JetClassStreamDataset,
     JetClassSubsetDataset,
+    chunk_size_for_workers,
     feature_names,
     n_features,
+    plan_shards,
     steps_per_epoch,
 )
 from cpen.training.base_datamodule import BaseDatamodule
@@ -119,6 +121,9 @@ class JetClassStreamDatamodule(BaseDatamodule):
                 n_jets=self.n_train_limit,
                 num_particles=self.num_particles,
                 feature_config=self.feature_config,
+                chunk_size=chunk_size_for_workers(
+                    self.n_train_limit, self.num_workers
+                ),
                 shuffle_seed=self.shuffle_seed,
                 sort_by_pt=self.sort_by_pt,
             )
@@ -170,9 +175,28 @@ class JetClassStreamDatamodule(BaseDatamodule):
             kwargs["prefetch_factor"] = 2
         return kwargs
 
+    def _resume_skip_jets(self) -> int:
+        """Jets already consumed this epoch, from a restored Lightning trainer."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return 0
+        completed = 0
+        try:
+            completed = int(trainer.fit_loop.epoch_loop.batch_progress.current.completed)
+        except Exception:
+            completed = int(getattr(trainer, "global_step", 0) or 0)
+        return max(0, completed) * int(self.batch_size)
+
     def train_dataloader(self) -> DataLoader:
         assert self._train is not None
         if isinstance(self._train, JetClassStreamDataset):
+            skip = self._resume_skip_jets()
+            self._train.skip_jets = skip
+            if skip:
+                log_info(
+                    f"[graphs] stream resume skip_jets={skip:,} "
+                    f"(batch_size={self.batch_size})"
+                )
             # Shuffling happens inside the worker's buffer; DataLoader must not
             # try to shuffle an IterableDataset.
             return DataLoader(self._train, shuffle=False, **self._stream_dataloader_kwargs())
@@ -186,18 +210,35 @@ class JetClassStreamDatamodule(BaseDatamodule):
             return steps_per_epoch(n, self.batch_size, self.num_workers)
         return -(-n // self.batch_size)
 
+    def _planned_size(self, split: str, limit: int | None) -> int:
+        """
+        Split size from the read plan, without opening any ROOT file.
+
+        The sweep driver asks for these before ``setup``, so this has to answer
+        from the file listing alone.
+        """
+        return sum(
+            s.n_jets for s in plan_shards(self.data_root, split, n_jets=limit)
+        )
+
     def probe_split_sizes(self) -> dict[str, int]:
         sizes: dict[str, int] = {}
-        for key, dataset in (
-            ("n_train", self._train),
-            ("n_val", self._val),
-            ("n_test", self._test),
+        for key, split, limit, dataset in (
+            ("n_train", "train", self.n_train_limit, self._train),
+            ("n_val", "val", self.n_val_limit, self._val),
+            ("n_test", "test", self.n_test_limit, self._test),
         ):
             if dataset is not None:
                 sizes[key] = int(getattr(dataset, "n_jets", len(dataset)))
+            else:
+                sizes[key] = self._planned_size(split, limit)
         return sizes
 
-    def run_info(self) -> dict[str, Any]:
+    def split_sizes(self) -> dict[str, int]:
+        return self.probe_split_sizes()
+
+    def _stream_metadata(self) -> dict[str, Any]:
+        """Keys shared by the parquet run record and the banner."""
         return {
             "jetclass_source": "raw-root-stream",
             "jetclass_features": self.feature_config,
@@ -205,4 +246,25 @@ class JetClassStreamDatamodule(BaseDatamodule):
             "jetclass_num_particles": self.num_particles,
             "jetclass_streaming": self.streaming,
             "jetclass_particle_normalization": "part-full-affine",
+            "graph_construction": self.graph_construction,
+            "graph_cache": False,
+            "graph_loading": "live",
+            "edge_mode": "star-radius",
+            "n_edge_features": self.get_edge_dim(),
         }
+
+    def run_metadata(self, split_sizes: dict[str, int]) -> dict[str, Any]:
+        return {
+            **self._stream_metadata(),
+            "num_workers": self.num_workers,
+            "num_particles": self.num_particles,
+            **split_sizes,
+        }
+
+    def metadata(self) -> dict[str, Any]:
+        meta = super().metadata()
+        meta.update(self._stream_metadata())
+        # ``super().setup`` cannot len() an IterableDataset, and the banner plus
+        # the muP LR scaling both read this, so answer from the read plan.
+        meta["n_train"] = self.probe_split_sizes()["n_train"]
+        return meta

@@ -28,6 +28,7 @@ from typing import Iterable, Sequence
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.lines import Line2D
 
 # (depth, width, heads); missing / N/A dimensions use -1.
 ModelArchKey = tuple[int, int, int]
@@ -51,6 +52,12 @@ PASCAL_OUT_ROOT = Path(
 )
 PASCAL_SLURM_DIRS: tuple[Path, ...] = (
     REPO_ROOT / "scans" / "pascal",
+) + DEFAULT_SLURM_DIRS
+JETCLASS_OUT_ROOT = Path(
+    "/scratch/gpfs/BHANIN/jdezoort/cpen_runs/jetclass_runs/jetclass_output/adam/sweep_lr"
+)
+JETCLASS_SLURM_DIRS: tuple[Path, ...] = (
+    REPO_ROOT / "scans" / "jets",
 ) + DEFAULT_SLURM_DIRS
 
 _RUN_RE = re.compile(r"^RUN:\s*(.+)$", re.M)
@@ -462,6 +469,40 @@ def filter_role(df: pd.DataFrame, role: str | None) -> pd.DataFrame:
     return df.loc[df["role"].eq(role)].copy()
 
 
+def format_n_train(n: float | int | str) -> str:
+    """Pretty dataset-size label: ``100000`` → ``100k``, ``1000000`` → ``1M``."""
+    if isinstance(n, str):
+        text = n.strip()
+        if text:
+            return text
+        n = 0
+    value = int(round(float(n)))
+    if value >= 1_000_000 and value % 1_000_000 == 0:
+        return f"{value // 1_000_000}M"
+    if value >= 1_000 and value % 1_000 == 0:
+        thousands = value // 1_000
+        if thousands % 1000 == 0:
+            return f"{thousands // 1000}M"
+        return f"{thousands}k"
+    return str(value)
+
+
+def metrics_at_epoch(df: pd.DataFrame, epoch: int = 0) -> pd.DataFrame:
+    """One epoch-row per ``job_id`` after ``epoch`` (Lightning 0 = first epoch)."""
+    ep = epoch_rows(df)
+    if ep.empty or "epoch" not in ep.columns:
+        return ep.iloc[0:0].copy()
+    ep = ep.loc[pd.to_numeric(ep["epoch"], errors="coerce").eq(int(epoch))].copy()
+    if ep.empty:
+        return ep
+    idx = ep.groupby("job_id")["global_step"].idxmax()
+    out = ep.loc[idx].copy()
+    sort_cols = [
+        c for c in ("n_train", "depth", "width", "heads", "eta_0") if c in out.columns
+    ]
+    return out.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
@@ -584,6 +625,151 @@ def plot_lr_scan(
     ax_va.set_title(r"Min val loss vs $\eta_0$")
 
     fig.tight_layout()
+    if stem:
+        savefig(fig, stem, fig_dir=fig_dir)
+    if show:
+        plt.show()
+    return fig
+
+
+_DATASET_SIZE_STYLES: tuple[tuple[str, str], ...] = (
+    ("o", "-"),
+    ("s", "--"),
+    ("^", "-."),
+    ("D", ":"),
+)
+
+
+def plot_dataset_size_lr(
+    df: pd.DataFrame,
+    *,
+    epoch: int = 0,
+    figsize: tuple[float, float] | None = None,
+    stem: str | None = "jetclass_dataset_size_lr_epoch1",
+    fig_dir: Path | None = None,
+    show: bool = True,
+) -> plt.Figure | None:
+    """
+    2×2 panels vs ``η0`` at a fixed Lightning epoch (default 0 = after 1 epoch).
+
+    Color encodes architecture ``(L, D, h)``; marker / linestyle encodes ``n_train``.
+    Every dataset size is drawn on the same axes.
+    """
+    metrics = metrics_at_epoch(df, epoch=epoch)
+    if metrics.empty:
+        print(f"Waiting for epoch={epoch} metrics…")
+        return None
+
+    y_specs = (
+        ("train_loss", "Train loss", rf"Train loss vs $\eta_0$"),
+        ("val_acc", "Val accuracy", rf"Val accuracy vs $\eta_0$"),
+        ("val_roc_auc", "Val ROC AUC", rf"Val ROC AUC vs $\eta_0$"),
+        (
+            "val_bg_rejection",
+            r"Val $1/\varepsilon_B$ ($\varepsilon_S=0.5$)",
+            r"Val background rejection vs $\eta_0$",
+        ),
+    )
+    missing = [col for col, _, _ in y_specs if col not in metrics.columns]
+    if missing:
+        print("Missing columns:", ", ".join(missing))
+
+    arch_keys = sorted(
+        {model_size_key(row) for _, row in metrics.iterrows()},
+        key=lambda ldh: (ldh[0], ldh[1], ldh[2]),
+    )
+    if "n_train" in metrics.columns and metrics["n_train"].notna().any():
+        size_keys = sorted(
+            int(v)
+            for v in pd.to_numeric(metrics["n_train"], errors="coerce").dropna().unique()
+        )
+        use_n_train = True
+    else:
+        size_keys = sorted(str(v) for v in metrics["role"].dropna().unique())
+        use_n_train = False
+
+    arch_colors = dict(zip(arch_keys, _color_cycle(len(arch_keys))))
+    size_styles = {
+        key: _DATASET_SIZE_STYLES[i % len(_DATASET_SIZE_STYLES)]
+        for i, key in enumerate(size_keys)
+    }
+    label_kwargs = arch_label_flags(metrics)
+
+    if figsize is None:
+        figsize = (FIGSIZE_TWIN[0], FIGSIZE_TWIN[1] * 1.95)
+    fig, axes = plt.subplots(2, 2, figsize=figsize, dpi=400)
+    flat = axes.ravel()
+
+    for ax, (col, ylabel, title) in zip(flat, y_specs):
+        if col not in metrics.columns:
+            ax.set_visible(False)
+            continue
+        for arch in arch_keys:
+            color = arch_colors[arch]
+            arch_sub = metrics.loc[mask_model_size(metrics, arch)]
+            if arch_sub.empty:
+                continue
+            for size in size_keys:
+                if use_n_train:
+                    sub = arch_sub.loc[
+                        pd.to_numeric(arch_sub["n_train"], errors="coerce").eq(int(size))
+                    ]
+                else:
+                    sub = arch_sub.loc[arch_sub["role"].astype(str).eq(str(size))]
+                if sub.empty or sub[col].isna().all():
+                    continue
+                sub = sub.sort_values("eta_0")
+                marker, ls = size_styles[size]
+                ax.plot(
+                    sub["eta_0"],
+                    sub[col],
+                    color=color,
+                    marker=marker,
+                    linestyle=ls,
+                    markersize=5.5,
+                    linewidth=1.4,
+                )
+        ax.set_xscale("log")
+        ax.set_xlabel(r"$\eta_0$")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+
+    arch_handles = [
+        Line2D(
+            [],
+            [],
+            color=arch_colors[key],
+            linestyle="-",
+            marker="o",
+            markersize=5,
+            linewidth=1.5,
+            label=model_size_label(key, **label_kwargs),
+        )
+        for key in arch_keys
+    ]
+    size_handles = [
+        Line2D(
+            [],
+            [],
+            color="0.25",
+            linestyle=size_styles[key][1],
+            marker=size_styles[key][0],
+            markersize=5.5,
+            linewidth=1.4,
+            label=format_n_train(key),
+        )
+        for key in size_keys
+    ]
+    fig.legend(
+        handles=arch_handles + size_handles,
+        loc="upper center",
+        ncol=min(5, max(2, len(arch_keys) + len(size_keys))),
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.04),
+        fontsize=8,
+        handlelength=2.4,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.90))
     if stem:
         savefig(fig, stem, fig_dir=fig_dir)
     if show:
@@ -1202,6 +1388,22 @@ class TransferStudy:
             depth=depth,
             width=self.d_ref if width is None else width,
             heads=heads,
+            stem=stem,
+            fig_dir=self.fig_dir,
+            show=show,
+        )
+
+    def plot_dataset_size_lr(
+        self,
+        role: str | None = None,
+        *,
+        epoch: int = 0,
+        stem: str | None = "jetclass_dataset_size_lr_epoch1",
+        show: bool = True,
+    ) -> plt.Figure | None:
+        return plot_dataset_size_lr(
+            self.by_role(role) if role else self.df,
+            epoch=epoch,
             stem=stem,
             fig_dir=self.fig_dir,
             show=show,

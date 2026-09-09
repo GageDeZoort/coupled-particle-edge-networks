@@ -52,12 +52,13 @@ def zero_masked_particles(x: torch.Tensor, mask: torch.Tensor | None = None) -> 
 
 
 def preprocess_particle_features(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
+    r"""
     Mask padding, retain raw four-vectors, and build ParT-kin model inputs.
 
     Returns (x_raw, x_model, mask) where ``x_model`` holds the seven
-    TopLandscape ``kin`` features (standardized). ``x_raw`` keeps physical
-    ``[E, px, py, pz]`` for graph construction and edge features.
+    TopLandscape / JetClass_kin features with ParT affine standardization
+    (no row-\(L^2\)). ``x_raw`` keeps physical ``[E, px, py, pz]`` for graph
+    construction and edge features.
     """
     mask = particle_mask_from_four_vectors(x)
     x_raw = zero_masked_particles(x, mask)
