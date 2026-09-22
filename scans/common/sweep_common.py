@@ -164,6 +164,44 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
         n_last = int(getattr(args, "train_last_blocks", 0) or 0)
         if n_last > 0:
             tags.append(f"lastblock{n_last}")
+    # JetClass → TopTagging (or any) fine-tune: isolate from scratch / pretrain dirs.
+    if getattr(args, "init_from", None) and not bool(getattr(args, "blob_run", False)):
+        tags.append("ft")
+        tags.append("initfrom")
+        if not getattr(args, "init_from_step", None):
+            from cpen.training.init_from import read_ckpt_global_step
+
+            args.init_from_step = read_ckpt_global_step(args.init_from)
+        pstep = int(getattr(args, "init_from_step", 0) or 0)
+        if pstep > 0:
+            tags.append(f"pstep{_format_count(pstep)}")
+        n_last = int(getattr(args, "train_last_blocks", 0) or 0)
+        if n_last > 0:
+            tags.append(f"lastblock{n_last}")
+    if toptagging_live_active(args):
+        tags.append("live")
+        edge_features = str(
+            getattr(args, "jetclass_edge_features", "part-interaction")
+            or "part-interaction"
+        )
+        if edge_features == "part-interaction":
+            tags.append("partint")
+        elif edge_features == "logdot-dp":
+            tags.append("logdot")
+        else:
+            tags.append(edge_features.replace("-", ""))
+        n_particles = int(getattr(args, "num_particles", 128) or 128)
+        if n_particles != 128:
+            tags.append(f"p{n_particles}")
+        live_knn = getattr(args, "live_knn_k", None)
+        if live_knn is not None and int(live_knn) > 0:
+            tags.append(f"knn{int(live_knn)}")
+        if bool(getattr(args, "no_star_hyperedges", False)):
+            tags.append("nostar")
+        max_steps = getattr(args, "max_steps", None)
+        if max_steps:
+            tags.append(f"s{_format_count(int(max_steps))}")
+        tags.append(f"seed{int(getattr(args, 'seed', 0) or 0)}")
     # Tag mock+real / real-only stream runs so they don't collide with MOCK-only dirs.
     stream_name = str(getattr(args, "stream_name", "all") or "all").strip().lower()
     include_real = bool(getattr(args, "include_real_streams", False))
@@ -198,6 +236,10 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
         tags.append("unipool")
     if bool(getattr(args, "hyperedge_only", False)):
         tags.append("nopair")
+    # Embedding-only LR correction C: encoder_{x,e} get C·η₀/√D; trunk stays η₀/√D.
+    corr = float(getattr(args, "corr", 1.0) or 1.0)
+    if abs(corr - 1.0) > 1e-12:
+        tags.append(f"c{format_eta(corr)}")
     if bool(getattr(args, "use_rope", False)):
         theta = float(getattr(args, "rope_theta", 100.0) or 100.0)
         if abs(theta - 100.0) > 1e-12:
@@ -325,6 +367,15 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
                 "Global RNG seed (Lightning seed_everything, including "
                 "DataLoader workers). Tagged in Pascal run names as seed{N}."
             )
+    parser.add_argument(
+        "--corr",
+        type=float,
+        default=1.0,
+        help=(
+            "Embedding LR correction C. Trunk / readout use η₀/√D; "
+            "encoder_x and encoder_e use C·η₀/√D. Default: 1."
+        ),
+    )
     parser.add_argument(
         "--no-estimate-gamma-rs",
         dest="estimate_gamma_rs",
@@ -575,9 +626,31 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         default=None,
         dest="init_from",
         help=(
-            "Optional Lightning .ckpt to warm-start weights (e.g. mock blob "
-            "best.ckpt before real-stream cell-split fine-tuning). Shape-matched "
-            "tensors are copied; class-weight buffers may be skipped."
+            "Optional Lightning .ckpt to warm-start weights (e.g. JetClass "
+            "pretrain last.ckpt before TopTagging fine-tune, or mock blob "
+            "best.ckpt before real-stream FT). Weights only — optimizer / step "
+            "start fresh. Readout / class-token heads are skipped when shapes "
+            "differ (10-way → 2-way)."
+        ),
+    )
+    parser.add_argument(
+        "--train-last-blocks",
+        type=int,
+        default=0,
+        dest="train_last_blocks",
+        help=(
+            "After --init-from, freeze encoder + early blocks and train only "
+            "the last N CPEN blocks plus readout. 0 (default) = full fine-tune."
+        ),
+    )
+    parser.add_argument(
+        "--toptagging-live",
+        action="store_true",
+        dest="toptagging_live",
+        help=(
+            "TopTagging: build star-$R$ (+ optional --live-knn-k) graphs on GPU "
+            "from HDF5 four-vectors, matching JetClass --jetclass-stream. "
+            "Required for JetClass→TopTagging fine-tune."
         ),
     )
     parser.add_argument(
@@ -719,6 +792,24 @@ def configure_graph_args(args):  # type: ignore[no-untyped-def]
         restore_model = args.model
         args.model = "capen-llama"
     cli_readout = getattr(args, "readout_mode", None)
+
+    if toptagging_live_active(args):
+        if _hier_args_active(args):
+            raise ValueError("--toptagging-live cannot combine with --hier-k")
+        if getattr(args, "star_radius", None) is None:
+            raise ValueError("--toptagging-live requires --star-radius")
+        if getattr(args, "graph_construction", None):
+            raise ValueError(
+                "--toptagging-live builds graphs on GPU; omit --graph-construction"
+            )
+        args.graph_construction = "live"
+        if restore_model is not None:
+            args.model = restore_model
+        if cli_readout is not None:
+            args.readout_mode = cli_readout
+        elif getattr(args, "readout_mode", None) is None:
+            args.readout_mode = "graph"
+        return
 
     if _hier_args_active(args):
         if getattr(args, "star_radius", None) is not None:
@@ -878,16 +969,26 @@ def jetclass_stream_active(args) -> bool:  # type: ignore[no-untyped-def]
     )
 
 
+def toptagging_live_active(args) -> bool:  # type: ignore[no-untyped-def]
+    """Whether TopTagging builds live star+$R$ / kNN graphs (FT / matched pretrain)."""
+    return str(getattr(args, "dataset", "") or "") == "toptagging" and bool(
+        getattr(args, "toptagging_live", False)
+    )
+
+
 def jetclass_live_graph_kwargs(args) -> dict:  # type: ignore[no-untyped-def]
-    """Live star-$R$ settings for the Lightning module (streaming runs only)."""
-    if not jetclass_stream_active(args):
+    """Live star-$R$ settings for the Lightning module (JetClass or TopTagging live)."""
+    jc = jetclass_stream_active(args)
+    tt = toptagging_live_active(args)
+    if not jc and not tt:
         return {}
     if str(getattr(args, "model", "") or "") == _BASELINE_TRANSFORMER:
         # Particle transformer: no live star graph.
         return {}
     radius = getattr(args, "star_radius", None)
     if radius is None:
-        raise ValueError("--jetclass-stream requires --star-radius for live graphs")
+        flag = "--jetclass-stream" if jc else "--toptagging-live"
+        raise ValueError(f"{flag} requires --star-radius for live graphs")
     live_knn = getattr(args, "live_knn_k", None)
     no_star = bool(getattr(args, "no_star_hyperedges", False))
     if no_star and (live_knn is None or int(live_knn) <= 0):
@@ -909,24 +1010,29 @@ def jetclass_live_graph_kwargs(args) -> dict:  # type: ignore[no-untyped-def]
 def create_jetclass_datamodule(args, *, data_root):  # type: ignore[no-untyped-def]
     """Star-$R$ caches, or raw ROOT streaming under ``--jetclass-stream``."""
     if not jetclass_stream_active(args):
-        return _orig_create_jetclass_datamodule(args, data_root=data_root)
+        dm = _orig_create_jetclass_datamodule(args, data_root=data_root)
+    else:
+        from cpen.apps.jets.jetclass_stream_datamodule import JetClassStreamDatamodule
 
-    from cpen.apps.jets.jetclass_stream_datamodule import JetClassStreamDatamodule
-
-    raw_root = getattr(args, "jetclass_raw_root", None) or data_root
-    num_workers = args.num_workers if args.num_workers is not None else 0
-    return JetClassStreamDatamodule(
-        data_root=raw_root,
-        batch_size=int(getattr(args, "batch_size", 128) or 128),
-        num_workers=num_workers,
-        num_particles=int(getattr(args, "num_particles", 128) or 128),
-        feature_config=str(getattr(args, "jetclass_features", "full") or "full"),
-        n_train=getattr(args, "n_train", None),
-        n_val=getattr(args, "n_val", None),
-        n_test=getattr(args, "n_test", None),
-        shuffle_seed=int(getattr(args, "seed", 0) or 0),
-        sort_by_pt=bool(getattr(args, "jetclass_sort_by_pt", False)),
-    )
+        raw_root = getattr(args, "jetclass_raw_root", None) or data_root
+        num_workers = args.num_workers if args.num_workers is not None else 0
+        dm = JetClassStreamDatamodule(
+            data_root=raw_root,
+            batch_size=int(getattr(args, "batch_size", 128) or 128),
+            num_workers=num_workers,
+            num_particles=int(getattr(args, "num_particles", 128) or 128),
+            feature_config=str(getattr(args, "jetclass_features", "full") or "full"),
+            n_train=getattr(args, "n_train", None),
+            n_val=getattr(args, "n_val", None),
+            n_test=getattr(args, "n_test", None),
+            shuffle_seed=int(getattr(args, "seed", 0) or 0),
+            sort_by_pt=bool(getattr(args, "jetclass_sort_by_pt", False)),
+        )
+    # Bytecode train_one_run reads dm.corr_adam / corr_sgd into LitCPEN.corr.
+    corr = float(getattr(args, "corr", 1.0) or 1.0)
+    dm.corr_adam = corr
+    dm.corr_sgd = corr
+    return dm
 
 
 def create_stream_datamodule(args, data_root):  # type: ignore[no-untyped-def]
@@ -1086,7 +1192,25 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
 
 
 def create_toptagging_datamodule(args, *, data_root, dense_pairs):  # type: ignore[no-untyped-def]
-    """Bytecode helper plus hierarchical cache branch (``--hier-k``)."""
+    """Bytecode helper plus hierarchical cache / live-graph branches."""
+    if toptagging_live_active(args):
+        from cpen.apps.jets.toptagging_live_datamodule import TopTaggingLiveDatamodule
+
+        num_workers = args.num_workers if args.num_workers is not None else 0
+        dm = TopTaggingLiveDatamodule(
+            data_root=data_root,
+            batch_size=int(getattr(args, "batch_size", 128) or 128),
+            num_workers=num_workers,
+            num_particles=int(getattr(args, "num_particles", 128) or 128),
+            n_train=getattr(args, "n_train", None),
+            n_val=getattr(args, "n_val", None),
+            n_test=getattr(args, "n_test", None),
+            data_seed=int(getattr(args, "data_seed", 42) or 42),
+        )
+        corr = float(getattr(args, "corr", 1.0) or 1.0)
+        dm.corr_adam = corr
+        dm.corr_sgd = corr
+        return dm
     if _hier_args_active(args):
         from cpen.datamodules.toptagging_hier_datamodule import TopTaggingHierDatamodule
 
@@ -1353,8 +1477,23 @@ def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
     """Like bytecode ``train_one_run``, with stream checkpoint / val-interval support."""
     import lightning as L
 
+    from cpen.training.init_from import (
+        assert_ft_root_not_pretrain,
+        freeze_except_last_blocks,
+        load_init_checkpoint,
+        read_ckpt_global_step,
+    )
+
     seed = int(getattr(args, "seed", 0) or 0)
     L.seed_everything(seed, workers=True)
+
+    init_from = getattr(args, "init_from", None)
+    if init_from:
+        args.init_from_step = read_ckpt_global_step(init_from)
+        root = getattr(args, "root", None)
+        if root and str(getattr(args, "dataset", "") or "") == "toptagging":
+            assert_ft_root_not_pretrain(root)
+
     raw = getattr(args, "val_check_interval", None)
     if raw is None:
         vci = None
@@ -1390,11 +1529,26 @@ def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
     if live_kwargs and "lit_factory" in kwargs:
         base_factory = kwargs["lit_factory"]
 
-        def lit_factory(*factory_args, **factory_kwargs):
+        def lit_factory_live(*factory_args, **factory_kwargs):
             factory_kwargs.update(live_kwargs)
             return base_factory(*factory_args, **factory_kwargs)
 
-        kwargs["lit_factory"] = lit_factory
+        kwargs["lit_factory"] = lit_factory_live
+
+    # Weights-only warm start (never loads optimizer / global_step from pretrain).
+    if init_from and "lit_factory" in kwargs:
+        inner = kwargs["lit_factory"]
+        n_last = int(getattr(args, "train_last_blocks", 0) or 0)
+
+        def lit_factory_init(*factory_args, **factory_kwargs):
+            lit = inner(*factory_args, **factory_kwargs)
+            load_init_checkpoint(lit, init_from, skip_readout=True)
+            if n_last > 0:
+                freeze_except_last_blocks(lit.model, n_blocks=n_last)
+            return lit
+
+        kwargs["lit_factory"] = lit_factory_init
+
     try:
         return _orig_train_one_run(args=args, **kwargs)
     finally:

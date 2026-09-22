@@ -17,8 +17,14 @@ class TransferModel(Protocol):
 
 
 def adam_lr(eta_0: float, width: int, *, corr: float = 1.0) -> float:
-    """Adam global LR: eta_0 / sqrt(D)."""
-    return corr * eta_0 / math.sqrt(width)
+    """Adam base LR: ``η₀ / √D``.
+
+    ``corr`` is accepted for call-site compatibility but is **not** applied here.
+    Embedding (first-layer) corrections multiply only ``encoder_x`` / ``encoder_e``
+    param groups in :meth:`BaseLitCPEN.configure_optimizers`.
+    """
+    del corr  # first-layer only; see BaseLitCPEN.configure_optimizers
+    return eta_0 / math.sqrt(width)
 
 
 def lambda_0_from_t_epoch(

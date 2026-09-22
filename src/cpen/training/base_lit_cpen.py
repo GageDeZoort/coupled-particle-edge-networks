@@ -483,25 +483,62 @@ class BaseLitCPEN(L.LightningModule):
         self._test_probs.clear()
         self._test_targets.clear()
 
+    @staticmethod
+    def _is_embedding_param(name: str) -> bool:
+        """True for ``encoder_x`` / ``encoder_e`` weights (not readout / blocks)."""
+        return any(part in {"encoder_x", "encoder_e"} for part in name.split("."))
+
     def configure_optimizers(self):
-        lr = self.model.get_lr(eta_0=self.eta_0, corr=self.corr)
+        # Base width-wise LR: η₀/√D for every layer. ``corr`` scales only the
+        # embedding encoders (encoder_x, encoder_e) — never readout / trunk.
+        # When corr==1, keep a single param group so resumes match checkpoints
+        # written before embedding-LR splits existed.
+        base_lr = self.model.get_lr(eta_0=self.eta_0, corr=1.0)
+        embed_lr = float(self.corr) * base_lr
         # Decoupled weight decay is AdamW-only; plain Adam uses L2-in-loss if wd>0.
         wd = self.weight_decay if self.optimizer_name == "adamw" else 0.0
-        params = [p for p in self.parameters() if p.requires_grad]
-        if not params:
+        embed_params: list = []
+        other_params: list = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if self._is_embedding_param(name):
+                embed_params.append(param)
+            else:
+                other_params.append(param)
+        if not embed_params and not other_params:
             raise ValueError("configure_optimizers: no trainable parameters")
+        split = abs(float(self.corr) - 1.0) > 1e-12
+        if split and not embed_params:
+            raise ValueError(
+                f"corr={self.corr:g} but no encoder_x/encoder_e parameters found; "
+                "refusing to silently apply a global LR multiplier"
+            )
+        if split:
+            param_groups = []
+            if other_params:
+                param_groups.append({"params": other_params, "lr": base_lr})
+            if embed_params:
+                param_groups.append({"params": embed_params, "lr": embed_lr})
+        else:
+            # Keep module parameter order (not other+embed). Reshuffling breaks
+            # Adam moment alignment on resume vs pre-corr single-group ckpts.
+            params = [p for p in self.parameters() if p.requires_grad]
+            param_groups = [{"params": params, "lr": base_lr}]
         if self.optimizer_name == "adam":
-            opt = torch.optim.Adam(params, lr=lr, weight_decay=wd, eps=self.ADAM_EPS)
+            opt = torch.optim.Adam(param_groups, weight_decay=wd, eps=self.ADAM_EPS)
         elif self.optimizer_name == "adamw":
-            opt = torch.optim.AdamW(params, lr=lr, weight_decay=wd, eps=self.ADAM_EPS)
+            opt = torch.optim.AdamW(param_groups, weight_decay=wd, eps=self.ADAM_EPS)
         elif self.optimizer_name == "sgd":
-            opt = torch.optim.SGD(params, lr=lr, weight_decay=wd, momentum=0.9)
+            opt = torch.optim.SGD(param_groups, weight_decay=wd, momentum=0.9)
         else:
             raise ValueError(f"Unknown optimizer {self.optimizer_name!r}")
 
         if self.scheduler_name == "cosine":
             scheduler = CosineAnnealingLR(
-                opt, T_max=self.trainer.max_epochs, eta_min=self.lr_decay_min_frac * lr
+                opt,
+                T_max=self.trainer.max_epochs,
+                eta_min=self.lr_decay_min_frac * base_lr,
             )
             return {"optimizer": opt, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
         return opt
