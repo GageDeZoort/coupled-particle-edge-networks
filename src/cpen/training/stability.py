@@ -61,6 +61,7 @@ FORWARD_KW = (
     "mask",
     "z",
     "wire_coordinates",
+    "rope_coordinates",
     "edge_type",
     "edge_mask",
     "node_mask",

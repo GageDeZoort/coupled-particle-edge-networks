@@ -8,7 +8,7 @@ lost in a restore). This module loads that bytecode and wraps:
 * ``add_common_args`` / ``configure_graph_args`` for ``--knn-min-pt``, which
   rewrites ``--graph-construction 8-NN`` into ``8-NN@pt1`` (etc.)
 * defaults ``--heavy-metrics-frac`` to ``0`` (ROC AUC / bg rejection every val)
-* optional ``--val-check-interval`` / ``--checkpoint-every-n-steps`` passed through to Lightning
+* optional ``--val-check-interval`` / ``--checkpoint-every-n-steps`` / ``--max-steps`` passed through to Lightning
 * ``build_model`` forwards ``--dropout`` into CPEN MLP residuals
 * stream obvious-star mask re-partition (``--stream-mask-seed``)
 * ``--include-real-streams`` to train on non-MOCK ``stream_*.pt`` as well
@@ -16,7 +16,9 @@ lost in a restore). This module loads that bytecode and wraps:
 * ``--identity-m22`` skips CAPEN/CAPEN-Llama edge–edge attention (``f_22 = Id``)
 * ``--incidence-m22`` replaces it with linear ``f_22 = S S^T h_e`` (no ``M×M`` attn)
 * ``--hyperedge-only`` drops all pairwise 2-edges (kNN, vn_link, deg≤2) at train time
+* ``--use-rope`` axial :math:`(\\eta,\\phi)`-RoPE on CAPEN-Llama-att / BaselineTransformer relation 11
 * ``capen-llama-att`` + hierarchical TopTagging caches (``--hier-k`` …)
+* ``baseline-transformer``: same Llama/CompleteP/class-token pool, M11 only (no 12/21/22)
 * attention ``γ_rs`` estimated from the first train batches before each fit
   (``--attention-normalization gamma``; opt out with ``--no-estimate-gamma-rs``)
 """
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import contextvars
 import importlib.util
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -59,6 +62,8 @@ _orig_create_toptagging_datamodule = _bc.create_toptagging_datamodule
 _orig_create_jetclass_datamodule = _bc.create_jetclass_datamodule
 
 _CAPEN_LLAMA_ATT = "capen-llama-att"
+_BASELINE_TRANSFORMER = "baseline-transformer"
+_ATTN_TRUNK_MODELS = frozenset({_CAPEN_LLAMA_ATT, _BASELINE_TRANSFORMER})
 _orig_create_stream_datamodule = _bc.create_stream_datamodule
 
 # train_one_run (bytecode) does not know about val_check_interval; inject via ctx.
@@ -73,6 +78,9 @@ _checkpoint_mode_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVa
 )
 _checkpoint_every_n_steps_ctx: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "cpen_checkpoint_every_n_steps", default=None
+)
+_max_steps_ctx: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "cpen_max_steps", default=None
 )
 _datamodule_factory_ctx: contextvars.ContextVar[object | None] = contextvars.ContextVar(
     "cpen_datamodule_factory", default=None
@@ -138,6 +146,24 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
             tags.append("nohyper")
         else:
             tags.append("hyper")
+        if bool(getattr(args, "blob_cell_split", False)):
+            tags.append("cellsplit")
+            gids = str(getattr(args, "blob_galaxies", "") or "0000").strip() or "0000"
+            tags.append(f"g{gids.replace(',', '-').replace(' ', '')}")
+        if bool(getattr(args, "blob_mask_holdout", False)):
+            tags.append("maskholdout")
+            gids = str(getattr(args, "blob_galaxies", "") or "0000").strip() or "0000"
+            tags.append(f"g{gids.replace(',', '-').replace(' ', '')}")
+            hold = str(getattr(args, "blob_holdout_streams", "") or "").strip()
+            if hold and "," not in hold and " " not in hold:
+                # Single-stream L1SO: tag the left-out name for run isolation.
+                safe = re.sub(r"[^A-Za-z0-9]+", "", hold)[:24] or "hold"
+                tags.append(f"l1so{safe}")
+        if getattr(args, "init_from", None):
+            tags.append("initfrom")
+        n_last = int(getattr(args, "train_last_blocks", 0) or 0)
+        if n_last > 0:
+            tags.append(f"lastblock{n_last}")
     # Tag mock+real / real-only stream runs so they don't collide with MOCK-only dirs.
     stream_name = str(getattr(args, "stream_name", "all") or "all").strip().lower()
     include_real = bool(getattr(args, "include_real_streams", False))
@@ -166,8 +192,20 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
         tags.append("idm22")
     if bool(getattr(args, "incidence_m22", False)):
         tags.append("incm22")
+    if bool(getattr(args, "all_edge_m22", False)):
+        tags.append("fullm22")
+    if bool(getattr(args, "uniform_output_pool", False)):
+        tags.append("unipool")
     if bool(getattr(args, "hyperedge_only", False)):
         tags.append("nopair")
+    if bool(getattr(args, "use_rope", False)):
+        theta = float(getattr(args, "rope_theta", 100.0) or 100.0)
+        if abs(theta - 100.0) > 1e-12:
+            tags.append(f"rope-th{format_eta(theta)}")
+        else:
+            tags.append("rope")
+    if str(getattr(args, "model", "") or "") == _BASELINE_TRANSFORMER:
+        tags.append("m11")
     dataset = str(getattr(args, "dataset", "") or "")
     readout = str(getattr(args, "readout_mode", "") or "")
     if readout == "node+edge" and dataset == "pascalvoc-sp":
@@ -197,17 +235,36 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
         features = str(getattr(args, "jetclass_features", "full") or "full")
         if features != "full":
             tags.append(features)
-        edge_features = str(
-            getattr(args, "jetclass_edge_features", "logdot-dp") or "logdot-dp"
-        )
-        if edge_features != "logdot-dp":
-            tags.append("partint")
+        if str(getattr(args, "model", "") or "") != _BASELINE_TRANSFORMER:
+            edge_features = str(
+                getattr(args, "jetclass_edge_features", "part-interaction")
+                or "part-interaction"
+            )
+            # Always tag edge mode so part-interaction (new default) does not
+            # resume older untagged logdot-dp run dirs.
+            if edge_features == "part-interaction":
+                tags.append("partint")
+            elif edge_features == "logdot-dp":
+                tags.append("logdot")
+            else:
+                tags.append(edge_features.replace("-", ""))
         n_particles = int(getattr(args, "num_particles", 128) or 128)
         if n_particles != 128:
             tags.append(f"p{n_particles}")
+        live_knn = getattr(args, "live_knn_k", None)
+        if live_knn is not None and int(live_knn) > 0:
+            tags.append(f"knn{int(live_knn)}")
+        if bool(getattr(args, "no_star_hyperedges", False)):
+            tags.append("nostar")
         n_train = getattr(args, "n_train", None)
         tags.append("Dfull" if n_train is None else f"D{_format_count(int(n_train))}")
+        max_steps = getattr(args, "max_steps", None)
+        if max_steps:
+            tags.append(f"s{_format_count(int(max_steps))}")
         tags.append(f"seed{int(getattr(args, 'seed', 0) or 0)}")
+    run_tag = str(getattr(args, "run_tag", "") or "").strip()
+    if run_tag:
+        tags.append(run_tag)
     if tags:
         kwargs["extra_tag"] = "_".join(tags)
     return replace(opts, **kwargs)
@@ -232,10 +289,11 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
                 "With --include-real-streams, 'all' expands to MOCK+real."
             )
         elif getattr(action, "dest", None) == "model" and action.choices is not None:
-            # Bytecode choices omit CAPEN-Llama-att.
+            # Bytecode choices omit CAPEN-Llama-att / BaselineTransformer.
             choices = list(action.choices)
-            if _CAPEN_LLAMA_ATT not in choices:
-                choices.append(_CAPEN_LLAMA_ATT)
+            for name in (_CAPEN_LLAMA_ATT, _BASELINE_TRANSFORMER):
+                if name not in choices:
+                    choices.append(name)
             action.choices = choices
         elif getattr(action, "dest", None) == "estimate_gamma_rs":
             action.default = True
@@ -346,14 +404,14 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
     parser.add_argument(
         "--jetclass-edge-features",
         type=str,
-        default="logdot-dp",
+        default="part-interaction",
         choices=("logdot-dp", "part-interaction"),
         help=(
             "Star-R hyperedge featurization against the support centroid. "
-            "'logdot-dp' = Minkowski dot plus lab-frame momentum difference "
-            "(3 of its 4 components are not rotation or boost invariant); "
             "'part-interaction' = the ParT set (ln Delta, ln k_T, ln z, ln m^2), "
-            "all four invariant. Default: logdot-dp."
+            "all four invariant (default); "
+            "'logdot-dp' = Minkowski dot plus lab-frame momentum difference "
+            "(3 of its 4 components are not rotation or boost invariant)."
         ),
     )
     parser.add_argument(
@@ -365,6 +423,27 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
             "Weight for the star-R support centroid. Defaults to 'energy' for "
             "logdot-dp (matching existing caches) and 'pt' for part-interaction, "
             "where pT weighting is required for exact boost invariance."
+        ),
+    )
+    parser.add_argument(
+        "--live-knn-k",
+        type=int,
+        default=None,
+        help=(
+            "With --jetclass-stream --star-radius: also append directed ΔR-kNN "
+            "2-edges (k neighbors per particle) featurized like the star edges. "
+            "Tags run dirs with knn<k>. Default: None (star hyperedges only)."
+        ),
+    )
+    parser.add_argument(
+        "--no-star-hyperedges",
+        action="store_true",
+        dest="no_star_hyperedges",
+        help=(
+            "With --jetclass-stream --live-knn-k: build only the ΔR-kNN 2-edges "
+            "(no star-R hyperedges). --star-radius is still required for "
+            "part-interaction feature standardization. Tags run dirs with "
+            "'nostar'."
         ),
     )
     parser.add_argument(
@@ -466,6 +545,42 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         ),
     )
     parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        dest="max_steps",
+        help=(
+            "Stop after N optimizer steps (Lightning max_steps), even if the "
+            "epoch iterator is longer. Use this as the long-run clock on the "
+            "JetClass stream: --batch-size is per GPU, so 2 GPUs at 512 is "
+            "global batch 1024 (~97,660 sharded steps / unique pass). Tags "
+            "the run dir with s{N} (e.g. s50k) so a step-capped job does not "
+            "resume an epoch-length Dfull run."
+        ),
+    )
+    parser.add_argument(
+        "--run-tag",
+        type=str,
+        default=None,
+        dest="run_tag",
+        help=(
+            "Extra token in the run directory name (e.g. 'scale'). Use this to "
+            "keep a study from resuming another even when L, D, n_train, and "
+            "max_steps match. Combine with a dedicated --root."
+        ),
+    )
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        dest="init_from",
+        help=(
+            "Optional Lightning .ckpt to warm-start weights (e.g. mock blob "
+            "best.ckpt before real-stream cell-split fine-tuning). Shape-matched "
+            "tensors are copied; class-weight buffers may be skipped."
+        ),
+    )
+    parser.add_argument(
         "--identity-m22",
         action="store_true",
         help=(
@@ -485,6 +600,27 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         ),
     )
     parser.add_argument(
+        "--all-edge-m22",
+        action="store_true",
+        dest="all_edge_m22",
+        help=(
+            "CAPEN-Llama-att: run relation-22 attention over every live edge "
+            "(not just incidence degree > 2). Default is hyperedge-only M22. "
+            "Tags run dirs with fullm22. Mutually exclusive with "
+            "--identity-m22 / --incidence-m22."
+        ),
+    )
+    parser.add_argument(
+        "--uniform-output-pool",
+        action="store_true",
+        dest="uniform_output_pool",
+        help=(
+            "CAPEN-Llama-att: replace class-token pooling with a mask-uniform "
+            "mean of decoded X and E, fused (z_X+z_E)/√2. Not energy pooling. "
+            "Tags run dirs with unipool."
+        ),
+    )
+    parser.add_argument(
         "--hyperedge-only",
         action="store_true",
         help=(
@@ -493,6 +629,25 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
             "2-member DBSCAN) and compact the edge axis. True hyperedges remain "
             "(DBSCAN with ≥3 members + virtual hypers). Does not drop virtual "
             "nodes from X and does not rebuild the cache. Tags run dirs with nopair."
+        ),
+    )
+    parser.add_argument(
+        "--use-rope",
+        action="store_true",
+        help=(
+            "CAPEN-Llama-att only: axial (η,φ)-RoPE on particle–particle (11) "
+            "attention. Angles are jet-centered (Δη, Δφ) from four-vectors "
+            "(same chart as ParT kin), not from affine-scaled x. Mutually "
+            "exclusive with --use-wire. Tags run dirs with rope."
+        ),
+    )
+    parser.add_argument(
+        "--rope-theta",
+        type=float,
+        default=100.0,
+        help=(
+            "RoPE base for --use-rope (default 100). Smaller than LLaMA's 10000 "
+            "because jet-centered Δη/Δφ are O(0.4), not token indices."
         ),
     )
     parser.add_argument(
@@ -557,10 +712,11 @@ def configure_graph_args(args):  # type: ignore[no-untyped-def]
     """Validate graph CLI options; fold ``--knn-min-pt`` into graph_construction."""
     from cpen.utils.graph_hierarchical import hierarchical_construction_tag
 
-    # Map CAPEN-Llama-att → capen-llama for bytecode graph/dropout guards.
+    # Map CAPEN-Llama-att / BaselineTransformer → capen-llama for bytecode graph/dropout guards.
     restore_model = None
-    if getattr(args, "model", None) == _CAPEN_LLAMA_ATT:
-        restore_model = _CAPEN_LLAMA_ATT
+    is_m11 = str(getattr(args, "model", "") or "") == _BASELINE_TRANSFORMER
+    if getattr(args, "model", None) in _ATTN_TRUNK_MODELS:
+        restore_model = args.model
         args.model = "capen-llama"
     cli_readout = getattr(args, "readout_mode", None)
 
@@ -587,6 +743,9 @@ def configure_graph_args(args):  # type: ignore[no-untyped-def]
     # Bytecode still errors: "--dropout is currently supported only with
     # --model capen or capen-llama". CPEN now uses dropout for MLP residuals,
     # so temporarily clear it for that check, then restore.
+    if is_m11 and getattr(args, "star_radius", None) is None:
+        # Bytecode JetClassLite still requires --star-radius (cache path).
+        args.star_radius = 0.2
     dropout = float(getattr(args, "dropout", 0.0) or 0.0)
     bypass_dropout_guard = getattr(args, "model", None) == "cpen" and dropout > 0.0
     saved_dropout = None
@@ -613,6 +772,11 @@ def configure_graph_args(args):  # type: ignore[no-untyped-def]
             args.dataset = restore_dataset
         if restore_readout is not None:
             args.readout_mode = restore_readout
+        if is_m11:
+            args.star_radius = None
+            gc = getattr(args, "graph_construction", None)
+            if gc is not None and str(gc).startswith("star-R"):
+                args.graph_construction = None
 
     # CLI wins. If omitted, force dataset defaults even when bytecode
     # already filled graph/node (Pascal must not silently stay graph).
@@ -652,6 +816,15 @@ def configure_graph_args(args):  # type: ignore[no-untyped-def]
                 f"--knn-min-pt={min_pt:g}"
             )
         args.graph_construction = compose_knn_spec(k, float(min_pt))
+    if bool(getattr(args, "use_rope", False)):
+        model = str(getattr(args, "model", "") or "")
+        if model not in _ATTN_TRUNK_MODELS:
+            raise ValueError(
+                "--use-rope is only implemented for --model capen-llama-att "
+                "or baseline-transformer"
+            )
+        if bool(getattr(args, "use_wire", False)):
+            raise ValueError("--use-rope and --use-wire are mutually exclusive")
     return args
 
 
@@ -709,16 +882,28 @@ def jetclass_live_graph_kwargs(args) -> dict:  # type: ignore[no-untyped-def]
     """Live star-$R$ settings for the Lightning module (streaming runs only)."""
     if not jetclass_stream_active(args):
         return {}
+    if str(getattr(args, "model", "") or "") == _BASELINE_TRANSFORMER:
+        # Particle transformer: no live star graph.
+        return {}
     radius = getattr(args, "star_radius", None)
     if radius is None:
         raise ValueError("--jetclass-stream requires --star-radius for live graphs")
-    return {
+    live_knn = getattr(args, "live_knn_k", None)
+    no_star = bool(getattr(args, "no_star_hyperedges", False))
+    if no_star and (live_knn is None or int(live_knn) <= 0):
+        raise ValueError("--no-star-hyperedges requires --live-knn-k > 0")
+    out = {
         "live_star_radius": float(radius),
         "live_edge_features": str(
-            getattr(args, "jetclass_edge_features", "logdot-dp") or "logdot-dp"
+            getattr(args, "jetclass_edge_features", "part-interaction")
+            or "part-interaction"
         ),
         "live_centroid_weight": getattr(args, "jetclass_centroid_weight", None),
+        "live_no_star_hyperedges": no_star,
     }
+    if live_knn is not None and int(live_knn) > 0:
+        out["live_graph_k"] = int(live_knn)
+    return out
 
 
 def create_jetclass_datamodule(args, *, data_root):  # type: ignore[no-untyped-def]
@@ -770,7 +955,8 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
 
     CAPEN / CAPEN-Llama are intentionally untouched here: they still go through
     ``_orig_build_model``, where ``dropout`` is attention-only
-    (``SupportAttention``), not MLP dropout. ``capen-llama-att`` is built here.
+    (``SupportAttention``), not MLP dropout. ``capen-llama-att`` and
+    ``baseline-transformer`` are built here.
     """
     if getattr(args, "model", None) == "cpen":
         from cpen.models.cpen import CPEN
@@ -805,14 +991,26 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
             dropout=float(getattr(args, "dropout", 0.0) or 0.0),
             **extra,
         )
-    if getattr(args, "model", None) == _CAPEN_LLAMA_ATT:
-        from cpen.models.capen_llama_att import CAPENLlamaAtt
+    if getattr(args, "model", None) in _ATTN_TRUNK_MODELS:
+        from cpen.models.capen_llama_att import BaselineTransformer, CAPENLlamaAtt
 
+        if bool(getattr(args, "all_edge_m22", False)) and (
+            bool(getattr(args, "identity_m22", False))
+            or bool(getattr(args, "incidence_m22", False))
+        ):
+            raise ValueError(
+                "--all-edge-m22 cannot combine with --identity-m22 or --incidence-m22"
+            )
         attention_gammas = _attention_gammas_from_args(args)
         dataset = getattr(args, "dataset", "toptagging")
         readout_mode = getattr(args, "readout_mode", "graph")
         all_to_all = (dataset != "pascalvoc-sp") and (readout_mode != "node")
-        model = CAPENLlamaAtt(
+        cls = (
+            BaselineTransformer
+            if str(args.model) == _BASELINE_TRANSFORMER
+            else CAPENLlamaAtt
+        )
+        model = cls(
             n_features=n_features,
             n_edge_features=n_edge_features,
             out_dim=out_dim,
@@ -837,9 +1035,14 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
             all_to_all_particle_attention=all_to_all,
             identity_m22=bool(getattr(args, "identity_m22", False)),
             incidence_m22=bool(getattr(args, "incidence_m22", False)),
-            hyperedge_m22_only=True,
+            hyperedge_m22_only=(
+                cls is CAPENLlamaAtt and not bool(getattr(args, "all_edge_m22", False))
+            ),
             ignore_knn_edges=bool(getattr(args, "hyperedge_only", False)),
             n_class_tokens=int(out_dim),
+            uniform_output_pool=bool(getattr(args, "uniform_output_pool", False)),
+            use_rope=bool(getattr(args, "use_rope", False)),
+            rope_theta=float(getattr(args, "rope_theta", 100.0) or 100.0),
         )
         return model
     # capen / capen-llama / particle-only: original factory (attention dropout only for CAPEN*).
@@ -856,6 +1059,13 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
         getattr(args, "incidence_m22", False)
     ):
         raise ValueError("--identity-m22 and --incidence-m22 cannot both be set")
+    if bool(getattr(args, "all_edge_m22", False)) and (
+        bool(getattr(args, "identity_m22", False))
+        or bool(getattr(args, "incidence_m22", False))
+    ):
+        raise ValueError(
+            "--all-edge-m22 cannot combine with --identity-m22 or --incidence-m22"
+        )
     if bool(getattr(args, "identity_m22", False)):
         if not hasattr(model, "identity_m22"):
             raise TypeError(
@@ -904,7 +1114,7 @@ def create_toptagging_datamodule(args, *, data_root, dense_pairs):  # type: igno
 
 def _attention_all_to_all_m11(args) -> bool:  # type: ignore[no-untyped-def]
     model = str(getattr(args, "model", "") or "")
-    if model not in ("capen-llama", _CAPEN_LLAMA_ATT):
+    if model not in ("capen-llama", _CAPEN_LLAMA_ATT, _BASELINE_TRANSFORMER):
         return False
     dataset = getattr(args, "dataset", "toptagging")
     readout_mode = getattr(args, "readout_mode", "graph")
@@ -915,9 +1125,9 @@ def _attention_gammas_from_args(args):  # type: ignore[no-untyped-def]
     """Build ``AttentionGammas`` for CAPEN-Llama-att without ``float(None)``.
 
     Bytecode ``train_one_run`` only calls ``resolve_attention_gammas`` for
-    ``capen`` / ``capen-llama``, so ``capen-llama-att`` arrives here with CLI
-    defaults ``gamma_*=None``. Estimate (or require explicit ``--gamma-*``)
-    before constructing the dataclass.
+    ``capen`` / ``capen-llama``, so ``capen-llama-att`` / ``baseline-transformer``
+    arrive here with CLI defaults ``gamma_*=None``. Estimate (or require explicit
+    ``--gamma-*``) before constructing the dataclass.
     """
     if getattr(args, "attention_normalization", "none") != "gamma":
         return None
@@ -1005,18 +1215,24 @@ def resolve_attention_gammas(args, data_root):  # type: ignore[no-untyped-def]
     from cpen.utils.attention_temperature import estimate_attention_gammas_from_datamodule
 
     all_to_all = _attention_all_to_all_m11(args)
-    hyperedge_m22 = str(getattr(args, "model", "") or "") == _CAPEN_LLAMA_ATT
+    hyperedge_m22 = str(getattr(args, "model", "") or "") == _CAPEN_LLAMA_ATT and not bool(
+        getattr(args, "all_edge_m22", False)
+    )
+    m11_only = str(getattr(args, "model", "") or "") == _BASELINE_TRANSFORMER
     drop_pairwise = bool(getattr(args, "hyperedge_only", False))
     n_jets = int(getattr(args, "gamma_estimate_jets", 512) or 512)
     live = jetclass_live_graph_kwargs(args)
     live_star = live.get("live_star_radius")
-    if live_star is None:
+    if live_star is None and not m11_only:
         live_star = getattr(args, "star_radius", None)
-    live_k = getattr(args, "live_graph_k", None)
+    live_k = live.get("live_graph_k")
+    if live_k is None:
+        live_k = getattr(args, "live_knn_k", None) or getattr(args, "live_graph_k", None)
+    live_no_star = bool(live.get("live_no_star_hyperedges", False))
     extra = (
         f"n_jets={n_jets} all_to_all_M11={all_to_all} "
         f"hyperedge_M22={hyperedge_m22} drop_pairwise={drop_pairwise} "
-        f"source=train-batches"
+        f"m11_only={m11_only} source=train-batches"
     )
     factory = _datamodule_factory_ctx.get()
     if factory is None:
@@ -1034,13 +1250,15 @@ def resolve_attention_gammas(args, data_root):  # type: ignore[no-untyped-def]
             drop_pairwise_edges=drop_pairwise,
             live_star_radius=float(live_star) if live_star is not None else None,
             live_graph_k=int(live_k) if live_k is not None else None,
+            live_no_star_hyperedges=live_no_star,
             live_edge_features=str(
                 live.get("live_edge_features")
-                or getattr(args, "jetclass_edge_features", "logdot-dp")
-                or "logdot-dp"
+                or getattr(args, "jetclass_edge_features", "part-interaction")
+                or "part-interaction"
             ),
             live_centroid_weight=live.get("live_centroid_weight")
             or getattr(args, "jetclass_centroid_weight", None),
+            m11_only=m11_only,
         )
     except Exception as exc:
         has_cli = all(
@@ -1065,7 +1283,12 @@ def _resolve_checkpoint_settings(args) -> tuple[str, str]:  # type: ignore[no-un
     monitor = getattr(args, "checkpoint_monitor", None)
     mode = getattr(args, "checkpoint_mode", None)
     if not monitor:
-        if getattr(args, "dataset", None) == "stream":
+        if bool(getattr(args, "blob_mask_holdout", False)):
+            # Discovery AUROC (~train_mask = holdouts) is often empty on val
+            # cells; checkpoint on supervised-node AUROC instead.
+            monitor = "val_sup_auroc"
+            mode = mode or "max"
+        elif getattr(args, "dataset", None) == "stream":
             edge_aux = str(getattr(args, "edge_aux", "hard-ce") or "hard-ce").lower()
             # Product consistency is an aux for nodes → checkpoint on node discovery.
             if "product" in edge_aux or "cons" in edge_aux:
@@ -1108,6 +1331,10 @@ def build_trainer(*args, **kwargs):  # type: ignore[no-untyped-def]
         every = _checkpoint_every_n_steps_ctx.get()
         if every is not None:
             kwargs["checkpoint_every_n_steps"] = every
+    if "max_steps" not in kwargs:
+        max_steps = _max_steps_ctx.get()
+        if max_steps is not None:
+            kwargs["max_steps"] = max_steps
     return _orig_build_trainer(*args, **kwargs)
 
 
@@ -1138,15 +1365,20 @@ def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
     ckpt_steps = int(raw_ckpt_steps) if raw_ckpt_steps else None
     if ckpt_steps is not None and ckpt_steps <= 0:
         ckpt_steps = None
+    raw_max_steps = getattr(args, "max_steps", None)
+    max_steps = int(raw_max_steps) if raw_max_steps else None
+    if max_steps is not None and max_steps <= 0:
+        max_steps = None
     token_vci = _val_check_interval_ctx.set(vci)
     token_mon = _checkpoint_monitor_ctx.set(monitor)
     token_mode = _checkpoint_mode_ctx.set(mode)
     token_ckpt_steps = _checkpoint_every_n_steps_ctx.set(ckpt_steps)
+    token_max_steps = _max_steps_ctx.set(max_steps)
     token_dm = _datamodule_factory_ctx.set(_datamodule_callable_from_kwargs(kwargs))
     # Bytecode only resolves attention γ for capen / capen-llama. Fill args
-    # before build_model so capen-llama-att does not float(None).
+    # before build_model so capen-llama-att / baseline-transformer do not float(None).
     if (
-        getattr(args, "model", None) == _CAPEN_LLAMA_ATT
+        getattr(args, "model", None) in _ATTN_TRUNK_MODELS
         and getattr(args, "attention_normalization", "none") == "gamma"
         and getattr(args, "gamma_11", None) is None
     ):
@@ -1170,6 +1402,7 @@ def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
         _checkpoint_monitor_ctx.reset(token_mon)
         _checkpoint_mode_ctx.reset(token_mode)
         _checkpoint_every_n_steps_ctx.reset(token_ckpt_steps)
+        _max_steps_ctx.reset(token_max_steps)
         _datamodule_factory_ctx.reset(token_dm)
 
 

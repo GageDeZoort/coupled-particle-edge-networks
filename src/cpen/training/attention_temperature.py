@@ -46,6 +46,8 @@ def materialize_batch_incidence(
     live_edge_features: str = "logdot-dp",
     live_centroid_weight: str | None = None,
     live_dense_pairs: bool = False,
+    live_no_star_hyperedges: bool = False,
+    m11_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Ensure ``incidence`` + node mask exist (live star/kNN or dense-from-COO)."""
     out = dict(batch)
@@ -56,7 +58,43 @@ def materialize_batch_incidence(
             mask = out.get("node_mask")
         if mask is None:
             raise ValueError("live graph batch requires mask or node_mask with x_raw")
-        if live_star_radius is not None:
+        if m11_only:
+            n_batch, n_nodes = int(mask.size(0)), int(mask.size(-1))
+            device = mask.device
+            out["incidence"] = torch.zeros(
+                n_batch, 1, n_nodes, dtype=torch.bool, device=device
+            )
+            out["edge_mask"] = torch.zeros(n_batch, 1, dtype=torch.bool, device=device)
+            out["edge_x"] = torch.zeros(n_batch, 1, 1, device=device)
+            out["mask"] = mask.bool()
+        elif live_no_star_hyperedges and live_graph_k is not None:
+            from cpen.graphs.graph_star import build_delta_r_knn_edges
+
+            edge_x, incidence = build_delta_r_knn_edges(
+                x_raw,
+                k=int(live_graph_k),
+                mask=mask,
+                edge_features=live_edge_features,
+                radius=float(live_star_radius or 0.2),
+            )
+            out["edge_x"] = edge_x
+            out["incidence"] = incidence
+            out["mask"] = mask.bool()
+        elif live_star_radius is not None and live_graph_k is not None:
+            from cpen.graphs.graph_star import build_star_plus_knn_graph
+
+            edge_x, incidence = build_star_plus_knn_graph(
+                x_raw,
+                radius=float(live_star_radius),
+                k=int(live_graph_k),
+                mask=mask,
+                edge_features=live_edge_features,
+                centroid_weight=live_centroid_weight,
+            )
+            out["edge_x"] = edge_x
+            out["incidence"] = incidence
+            out["mask"] = mask.bool()
+        elif live_star_radius is not None:
             from cpen.graphs.graph_star import build_star_radius_graph
 
             edge_x, incidence, _ = build_star_radius_graph(
@@ -124,6 +162,8 @@ def estimate_attention_gammas_from_batches(
     live_graph_k: int | None = None,
     live_edge_features: str = "logdot-dp",
     live_centroid_weight: str | None = None,
+    live_no_star_hyperedges: bool = False,
+    m11_only: bool = False,
 ) -> tuple[Any, dict[str, dict[str, Any]]]:
     """Mean nonempty support row degrees from the first train batches."""
     degree_lists: dict[str, list[np.ndarray]] = {k: [] for k in ("11", "12", "21", "22")}
@@ -139,6 +179,8 @@ def estimate_attention_gammas_from_batches(
             live_graph_k=live_graph_k,
             live_edge_features=live_edge_features,
             live_centroid_weight=live_centroid_weight,
+            live_no_star_hyperedges=live_no_star_hyperedges,
+            m11_only=m11_only,
         )
         if "incidence" not in batch:
             raise ValueError("batch is missing incidence after materialize")
@@ -214,6 +256,8 @@ def estimate_attention_gammas_from_datamodule(
     live_graph_k: int | None = None,
     live_edge_features: str = "logdot-dp",
     live_centroid_weight: str | None = None,
+    live_no_star_hyperedges: bool = False,
+    m11_only: bool = False,
 ) -> tuple[Any, dict[str, dict[str, Any]]]:
     """Pull the first train batches from ``datamodule`` and estimate γ."""
     from torch.utils.data import DataLoader
@@ -247,6 +291,8 @@ def estimate_attention_gammas_from_datamodule(
         live_graph_k=live_graph_k,
         live_edge_features=live_edge_features,
         live_centroid_weight=live_centroid_weight,
+        live_no_star_hyperedges=live_no_star_hyperedges,
+        m11_only=m11_only,
     )
 
 

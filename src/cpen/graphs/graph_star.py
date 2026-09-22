@@ -286,6 +286,119 @@ def build_star_radius_graph(
     return edge_x, incidence, hyperedge_index
 
 
+def build_delta_r_knn_edges(
+    x_raw: torch.Tensor,
+    *,
+    k: int,
+    mask: torch.Tensor | None = None,
+    edge_features: str = "part-interaction",
+    radius: float = 0.2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Directed ΔR-kNN 2-edges among particles.
+
+    Returns
+    -------
+    edge_x:
+        ``(B, N·k, 4)`` — empty for padded / inactive slots.
+    incidence:
+        ``(B, N·k, N)`` — each live slot is a deg-1 (self) or deg-2 edge.
+    """
+    if k < 1:
+        raise ValueError(f"k must be >= 1; got {k}")
+    if edge_features not in EDGE_FEATURE_MODES:
+        raise ValueError(
+            f"edge_features must be one of {EDGE_FEATURE_MODES}; got {edge_features!r}"
+        )
+    if mask is None:
+        mask = particle_mask_from_four_vectors(x_raw)
+
+    batch, n_particles, _ = x_raw.shape
+    device = x_raw.device
+    dtype = x_raw.dtype
+    knn_k = min(int(k), n_particles)
+    n_slots = n_particles * int(k)
+
+    eta, phi = eta_phi_from_four_vectors_torch(x_raw)
+    dr = delta_r_torch(eta.unsqueeze(-1), phi.unsqueeze(-1), eta.unsqueeze(-2), phi.unsqueeze(-2))
+    pair_ok = mask.unsqueeze(-1) & mask.unsqueeze(-2)
+    dr = dr.masked_fill(~pair_ok, float("inf"))
+    eye = torch.eye(n_particles, device=device, dtype=torch.bool).unsqueeze(0)
+    # Include self at distance 0 so every active particle has at least one slot.
+    dr = torch.where(eye & mask.unsqueeze(-1), torch.zeros_like(dr), dr)
+
+    knn_dist, knn_idx = dr.topk(knn_k, dim=-1, largest=False)
+    finite = torch.isfinite(knn_dist) & mask.unsqueeze(-1)
+
+    src = (
+        torch.arange(n_particles, device=device)
+        .view(1, n_particles, 1)
+        .expand(batch, -1, knn_k)
+    )
+    dst = knn_idx
+    e_ids = (
+        torch.arange(n_particles, device=device).view(1, n_particles, 1) * int(k)
+        + torch.arange(knn_k, device=device).view(1, 1, knn_k)
+    ).expand(batch, -1, -1)
+    b_ids = (
+        torch.arange(batch, device=device).view(batch, 1, 1).expand(batch, n_particles, knn_k)
+    )
+
+    incidence = torch.zeros(batch, n_slots, n_particles, dtype=dtype, device=device)
+    edge_x = torch.zeros(batch, n_slots, 4, dtype=dtype, device=device)
+    flat_b = b_ids[finite]
+    flat_e = e_ids[finite]
+    flat_s = src[finite]
+    flat_d = dst[finite]
+    if flat_e.numel():
+        incidence[flat_b, flat_e, flat_s] = 1.0
+        incidence[flat_b, flat_e, flat_d] = 1.0
+        p_s = x_raw[flat_b, flat_s]
+        p_d = x_raw[flat_b, flat_d]
+        if edge_features == "logdot-dp":
+            feats = lorentz_edge_features(p_s.unsqueeze(1), p_d.unsqueeze(1)).squeeze(1)
+        else:
+            feats = standardize_part_interaction(
+                part_interaction_features(p_s, p_d),
+                radius=radius,
+            )
+        edge_x[flat_b, flat_e] = feats.to(dtype)
+    return edge_x, incidence
+
+
+def build_star_plus_knn_graph(
+    x_raw: torch.Tensor,
+    *,
+    radius: float,
+    k: int,
+    mask: torch.Tensor | None = None,
+    edge_features: str = "part-interaction",
+    centroid_weight: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Concatenate star-$R$ hyperedges with directed ΔR-kNN 2-edges.
+
+    Layout along the edge axis: ``[star (N) | knn (N·k)]``. CAPEN-Llama-att
+    M22 still keys off incidence degree (>2 ⇒ hyperedge attention; 2-edges
+    keep identity ``f_22``) so the kNN slots participate in M12/M21 only.
+    """
+    star_x, star_inc, _ = build_star_radius_graph(
+        x_raw,
+        radius=radius,
+        mask=mask,
+        edge_features=edge_features,
+        centroid_weight=centroid_weight,
+    )
+    knn_x, knn_inc = build_delta_r_knn_edges(
+        x_raw,
+        k=k,
+        mask=mask,
+        edge_features=edge_features,
+        radius=radius,
+    )
+    return torch.cat([star_x, knn_x], dim=1), torch.cat([star_inc, knn_inc], dim=1)
+
+
 def build_star_radius_graph_single(
     x_raw: torch.Tensor,
     *,

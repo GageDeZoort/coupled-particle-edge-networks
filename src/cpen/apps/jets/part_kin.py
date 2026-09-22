@@ -66,6 +66,29 @@ _PART_KIN_PREPROCESS: dict[str, tuple[float, float]] = {
 }
 
 
+def jet_centered_deta_dphi(
+    constituents: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Jet-centered :math:`(\\Delta\\eta, \\Delta\\phi)` for :math:`(\\eta,\\phi)`-RoPE.
+
+    Same chart as ParT kin ``part_deta`` / ``part_dphi``: jet axis is the
+    constituent 4-sum, :math:`\\Delta\\eta` includes the :math:`\\mathrm{sign}(\\eta_J)`
+    flip, and :math:`\\Delta\\phi` is wrapped with ``atan2``. Pads are zeros
+    (they sit at the jet origin; attention already masks them).
+
+    Returns ``(..., 2)``. These columns are *not* affine-scaled; do not take
+    RoPE angles from model input ``x``.
+    """
+    feats = build_part_kin_features(
+        constituents, mask, eps=eps, l2_normalize=False
+    )
+    return feats[..., -2:].contiguous()
+
+
 def pt_fraction_weights(
     constituents: torch.Tensor,
     mask: torch.Tensor | None = None,

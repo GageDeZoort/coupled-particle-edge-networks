@@ -49,6 +49,8 @@ class RunOptions:
     n_features: int | None = None
     use_wire: bool = False
     wire_coordinate_dim: int = 8
+    use_rope: bool = False
+    rope_theta: float = 100.0
     # CPEN / particle-only incidence scaling. Always emitted when set so
     # ``degree`` and ``gamma`` runs never share an output directory.
     operator_normalization: str | None = None
@@ -106,6 +108,11 @@ class RunOptions:
             parts.append(f"g{gtag}")
         if self.use_wire:
             parts.append(f"wirem{self.wire_coordinate_dim}")
+        if self.use_rope:
+            if abs(float(self.rope_theta) - 100.0) > 1e-12:
+                parts.append(f"rope-th{format_eta(self.rope_theta)}")
+            else:
+                parts.append("rope")
         if self.extra_tag:
             parts.append(self.extra_tag.replace("_", "-"))
         if not parts:

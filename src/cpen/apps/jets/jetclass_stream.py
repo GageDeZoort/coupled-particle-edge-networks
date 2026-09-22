@@ -340,6 +340,39 @@ def split_plan_over_workers(
     )
 
 
+def split_plan_over_replicas(
+    shards: Sequence[Shard],
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+    worker_id: int = 0,
+    num_workers: int = 1,
+) -> list[Shard]:
+    """
+    One (DDP rank, DataLoader worker) slice of the plan.
+
+    Without this, every rank iterates the full stream and an epoch has
+    ``world_size`` times as many optimizer steps as a unique pass at global
+    batch ``batch_size * world_size``. Replica slices are class-balanced the
+    same way as workers. When ``world_size > 1`` every replica is truncated to
+    the shortest replica so DDP ranks exhaust on the same step.
+    """
+    world_size = max(1, int(world_size))
+    num_workers = max(1, int(num_workers))
+    rank = int(rank)
+    worker_id = int(worker_id)
+    if world_size == 1:
+        return split_plan_over_workers(shards, worker_id, num_workers)
+    n_replicas = world_size * num_workers
+    replica_id = rank * num_workers + worker_id
+    plan = split_plan_over_workers(shards, replica_id, n_replicas)
+    quota = min(
+        sum(s.n_jets for s in split_plan_over_workers(shards, i, n_replicas))
+        for i in range(n_replicas)
+    )
+    return take_round_robin_shards(plan, quota)
+
+
 def chunk_size_for_workers(n_jets: int | None, num_workers: int) -> int:
     """
     Largest chunk size that still gives every worker a shard of every class.
@@ -387,6 +420,69 @@ def _trim_class_shards(shards: list[Shard], n_jets: int) -> list[Shard]:
         )
         remaining = 0
     return out
+
+
+def _keep_class_shards(shards: Sequence[Shard], n_jets: int) -> list[Shard]:
+    """Keep the first ``n_jets`` jets of one class's ordered shard list."""
+    remaining = max(0, int(n_jets))
+    out: list[Shard] = []
+    for shard in shards:
+        if remaining <= 0:
+            break
+        if shard.n_jets <= remaining:
+            out.append(shard)
+            remaining -= shard.n_jets
+            continue
+        out.append(
+            Shard(
+                shard.path,
+                shard.label,
+                shard.entry_start,
+                shard.entry_start + remaining,
+            )
+        )
+        remaining = 0
+    return out
+
+
+def take_round_robin_shards(shards: Sequence[Shard], n_take: int) -> list[Shard]:
+    """
+    Keep a class-interleaved prefix of ``n_take`` jets without reading ROOT.
+
+    Matches ``_stream_jets`` emission order. Used to equalize DDP replica
+    lengths so every rank exhausts on the same optimizer step.
+    """
+    pending: list[list[Shard]] = [[] for _ in range(N_CLASSES)]
+    for shard in shards:
+        pending[shard.label].append(shard)
+    left = [sum(s.n_jets for s in pending[i]) for i in range(N_CLASSES)]
+    total = sum(left)
+    n_take = max(0, min(int(n_take), total))
+    if n_take == 0:
+        return []
+    if n_take == total:
+        return list(shards)
+    keep = [0] * N_CLASSES
+    remaining = n_take
+    while remaining > 0:
+        active = [label for label in range(N_CLASSES) if keep[label] < left[label]]
+        if not active:
+            break
+        n_active = len(active)
+        per_class, leftover = divmod(remaining, n_active)
+        if per_class:
+            take = min(per_class, min(left[i] - keep[i] for i in active))
+            take = max(1, take)
+            for label in active:
+                keep[label] += take
+            remaining -= take * n_active
+            continue
+        for label in active[:leftover]:
+            keep[label] += 1
+        remaining = 0
+    return _interleave_classes(
+        [_keep_class_shards(pending[label], keep[label]) for label in range(N_CLASSES)]
+    )
 
 
 def skip_round_robin_shards(shards: Sequence[Shard], n_skip: int) -> list[Shard]:
@@ -499,14 +595,17 @@ class JetClassStreamDataset(IterableDataset):
     Single-pass, class-interleaved stream over raw JetClass ROOT files.
 
     For the compute-optimal regime, where every jet is seen exactly once. Shards
-    are distributed across DataLoader workers, and each worker holds one open
-    chunk per class and emits round-robin over them, so every batch is class
-    balanced without ever holding the split in memory. A shuffle buffer on top
-    breaks the within-class file ordering.
+    are distributed across DDP ranks and DataLoader workers, and each worker
+    holds one open chunk per class and emits round-robin over them, so every
+    batch is class balanced without ever holding the split in memory.
 
     ``shuffle_seed`` varies the emission order (not the class-balanced plan
-    itself), so the set of jets seen for a given ``n_jets`` is reproducible
-    while their order varies.
+    itself) when ``shuffle_buffer > 1``. The set of jets for a given ``n_jets``
+    is always the same. ``shuffle_buffer <= 1`` yields the class-interleaved
+    ROOT order, so a resumed job that skips already-consumed jets continues
+    straight through the files instead of reshuffling the same prefix.
+    ``ddp_rank`` / ``ddp_world_size`` must be set on the dataset *before*
+    workers are spawned (DataLoader workers do not inherit the process group).
     """
 
     def __init__(
@@ -522,6 +621,8 @@ class JetClassStreamDataset(IterableDataset):
         shuffle_seed: int = 0,
         sort_by_pt: bool = False,
         skip_jets: int = 0,
+        ddp_rank: int = 0,
+        ddp_world_size: int = 1,
     ) -> None:
         self.data_root = Path(data_root)
         self.split = split
@@ -532,6 +633,8 @@ class JetClassStreamDataset(IterableDataset):
         self.shuffle_seed = shuffle_seed
         self.sort_by_pt = sort_by_pt
         self.skip_jets = max(0, int(skip_jets))
+        self.ddp_rank = max(0, int(ddp_rank))
+        self.ddp_world_size = max(1, int(ddp_world_size))
         self.shards = plan_shards(
             data_root, split, n_jets=n_jets, chunk_size=chunk_size
         )
@@ -540,12 +643,25 @@ class JetClassStreamDataset(IterableDataset):
     def __len__(self) -> int:
         return self.n_jets
 
-    def _worker_shards(self) -> list[Shard]:
-        """Slice of the plan for this worker, preserving class balance."""
+    def _replica_ids(self) -> tuple[int, int, int, int]:
+        """(rank, world_size, worker_id, num_workers) for this iterator."""
         info = get_worker_info()
-        if info is None:
-            return list(self.shards)
-        return split_plan_over_workers(self.shards, info.id, info.num_workers)
+        n_workers = 1 if info is None else info.num_workers
+        worker_id = 0 if info is None else info.id
+        rank = max(0, int(getattr(self, "ddp_rank", 0) or 0))
+        world = max(1, int(getattr(self, "ddp_world_size", 1) or 1))
+        return rank, world, worker_id, n_workers
+
+    def _worker_shards(self) -> list[Shard]:
+        """Slice of the plan for this DDP rank and worker, class balanced."""
+        rank, world, worker_id, n_workers = self._replica_ids()
+        return split_plan_over_replicas(
+            self.shards,
+            rank=rank,
+            world_size=world,
+            worker_id=worker_id,
+            num_workers=n_workers,
+        )
 
     def _read_shard_jets(self, shard: Shard) -> list[dict[str, torch.Tensor]]:
         chunk = read_shard(
@@ -595,20 +711,22 @@ class JetClassStreamDataset(IterableDataset):
             active = still_active
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        info = get_worker_info()
-        seed = self.shuffle_seed + (0 if info is None else info.id)
-        rng = np.random.default_rng(seed)
-        n_workers = 1 if info is None else info.num_workers
-        worker_id = 0 if info is None else info.id
+        rank, _world, worker_id, n_workers = self._replica_ids()
         worker_skip = skip_jets_for_worker(
             self.skip_jets, worker_id=worker_id, num_workers=n_workers
         )
         shards = skip_round_robin_shards(self._worker_shards(), worker_skip)
-
-        # Arrivals are already class-balanced, so the buffer only has to break
-        # the within-class file ordering; it is emitted in permuted blocks.
+        stream = self._stream_jets(shards)
+        # Sequential pass: skip-ahead lands on the next unread jet in file
+        # order. A shuffle buffer would re-permute that suffix with a reset
+        # RNG and is not needed for class balance (arrivals are round-robin).
+        if int(self.shuffle_buffer) <= 1:
+            yield from stream
+            return
+        seed = self.shuffle_seed + rank * 1024 + worker_id
+        rng = np.random.default_rng(seed)
         buffer: list[dict[str, torch.Tensor]] = []
-        for jet in self._stream_jets(shards):
+        for jet in stream:
             buffer.append(jet)
             if len(buffer) >= self.shuffle_buffer:
                 for index in rng.permutation(len(buffer)):
@@ -618,13 +736,18 @@ class JetClassStreamDataset(IterableDataset):
             yield buffer[index]
 
 
-def steps_per_epoch(n_jets: int, batch_size: int, num_workers: int) -> int:
+def steps_per_epoch(
+    n_jets: int, batch_size: int, num_workers: int, world_size: int = 1
+) -> int:
     """
-    Batches a streaming epoch yields.
+    Optimizer steps a streaming epoch yields on each DDP rank.
 
-    Each worker batches its own shard slice independently, so the last partial
-    batch per worker is kept and the total exceeds ``n_jets // batch_size``.
+    Each DataLoader worker batches its own replica slice independently, so the
+    last partial batch per worker is kept and the total can exceed
+    ``n_jets // (batch_size * world_size)``. ``world_size`` is the DDP replica
+    count: ranks do not re-walk each other's shards.
     """
-    workers = max(1, num_workers)
-    per_worker = n_jets / workers
-    return workers * math.ceil(per_worker / batch_size)
+    world = max(1, int(world_size))
+    workers = max(1, int(num_workers))
+    per_replica = n_jets / (world * workers)
+    return workers * math.ceil(per_replica / batch_size)

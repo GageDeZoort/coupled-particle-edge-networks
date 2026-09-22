@@ -27,10 +27,17 @@ for _name, _value in vars(_bc).items():
             pass
     globals()[_name] = _value
 
-# Regression metrics (QM9) postdate the bytecode parquet logger.
-_REGRESSION_METRIC_KEYS = ("train_mae", "val_mae", "test_mae")
+# Regression metrics (QM9) and mask-holdout supervised AUROC postdate the
+# bytecode parquet logger's METRIC_KEYS whitelist.
+_EXTRA_METRIC_KEYS = (
+    "train_mae",
+    "val_mae",
+    "test_mae",
+    "val_sup_auroc",
+    "test_sup_auroc",
+)
 _logger = globals().get("ParquetLoggerCallback")
 if _logger is not None and hasattr(_logger, "METRIC_KEYS"):
     _logger.METRIC_KEYS = tuple(_logger.METRIC_KEYS) + tuple(
-        key for key in _REGRESSION_METRIC_KEYS if key not in _logger.METRIC_KEYS
+        key for key in _EXTRA_METRIC_KEYS if key not in _logger.METRIC_KEYS
     )

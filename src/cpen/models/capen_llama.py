@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import torch
+from torch import nn
 
 # Ensure wrapped CAPEN is registered before the Llama bytecode imports it.
 from cpen.models.capen import CAPEN as _  # noqa: F401
@@ -38,6 +39,76 @@ _BaseLlama = globals()["CAPENLlama"]
 class CAPENLlama(_BaseLlama):
     """Bytecode CAPEN-Llama + Pascal token-wise node / node+edge readout."""
 
+    def __init__(
+        self,
+        *args: object,
+        use_rope: bool = False,
+        rope_theta: float = 100.0,
+        **kwargs: object,
+    ) -> None:  # type: ignore[no-untyped-def]
+        if bool(use_rope) and bool(kwargs.get("use_wire", False)):
+            raise ValueError(
+                "use_rope and use_wire are mutually exclusive (both rotate Q/K on M11)"
+            )
+        super().__init__(*args, **kwargs)
+        self.rope_theta = float(rope_theta)
+        self.use_rope = False
+        self.rope_11 = None
+        if bool(use_rope):
+            # Graph-mode bytecode forward does not apply RoPE; att / token-wise do.
+            if type(self) is CAPENLlama:
+                raise ValueError(
+                    "use_rope is only implemented on CAPEN-Llama-att "
+                    "(class-token readout owns the 11-block hook)"
+                )
+            self._init_etaphi_rope(theta=self.rope_theta)
+
+    def _init_etaphi_rope(self, *, theta: float = 100.0) -> None:
+        from cpen.models.etaphi_rope import EtaPhiRoPE
+
+        head_dim = int(self.head_dim)
+        heads = int(self.heads)
+        self.use_rope = True
+        self.rope_theta = float(theta)
+        self.rope_11 = nn.ModuleList(
+            [
+                EtaPhiRoPE(head_dim, heads, theta=self.rope_theta)
+                for _ in range(int(self.depth))
+            ]
+        )
+
+    def _particle_rope_coordinates(
+        self,
+        *,
+        rope_coordinates: torch.Tensor | None,
+        x_raw: torch.Tensor | None,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if rope_coordinates is not None:
+            return rope_coordinates
+        if x_raw is None:
+            raise ValueError(
+                "--use-rope needs rope_coordinates or x_raw [E, px, py, pz] "
+                "(do not read angles from affine-scaled particle features)"
+            )
+        from cpen.apps.jets.part_kin import jet_centered_deta_dphi
+
+        return jet_centered_deta_dphi(x_raw, mask)
+
+    def _relation_11_rotary(
+        self,
+        layer_idx: int,
+        *,
+        rope_coords: torch.Tensor | None,
+        wire_coords: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, nn.Module | None]:
+        """Coordinates + rotary module for relation 11 (RoPE xor WIRE)."""
+        if rope_coords is not None and getattr(self, "rope_11", None) is not None:
+            return rope_coords, self.rope_11[layer_idx]
+        if wire_coords is not None and getattr(self, "wire_11", None) is not None:
+            return wire_coords, self.wire_11[layer_idx]
+        return None, None
+
     def _forward_hidden(  # type: ignore[no-untyped-def]
         self,
         x: torch.Tensor,
@@ -52,6 +123,8 @@ class CAPENLlama(_BaseLlama):
         mask: torch.Tensor | None = None,
         z: torch.Tensor | None = None,  # noqa: ARG002
         wire_coordinates: torch.Tensor | None = None,
+        rope_coordinates: torch.Tensor | None = None,
+        x_raw: torch.Tensor | None = None,
         **_ignored: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """SwiGLU / WIRE trunk; same residual order as bytecode ``forward``."""
@@ -87,6 +160,13 @@ class CAPENLlama(_BaseLlama):
             wire_coords = self._particle_wire_coordinates(
                 s_bool, mask, wire_coordinates=wire_coordinates
             )
+        rope_coords = None
+        if bool(getattr(self, "use_rope", False)):
+            rope_coords = self._particle_rope_coordinates(
+                rope_coordinates=rope_coordinates,
+                x_raw=x_raw,
+                mask=mask,
+            )
         h_x = self.encoder_x(x) * self._encoder_x_scale
         h_e = self.encoder_e(edge_x) * self._encoder_e_scale
         self._record_probe("encode", h_x, h_e, mask)
@@ -95,9 +175,9 @@ class CAPENLlama(_BaseLlama):
         for layer_idx in range(self.depth):
             x_ln = self.ln(h_x)
             e_ln = self.ln(h_e)
-            wire = None
-            if wire_coords is not None and hasattr(self, "wire_11"):
-                wire = self.wire_11[layer_idx]
+            rot_coords, rotary = self._relation_11_rotary(
+                layer_idx, rope_coords=rope_coords, wire_coords=wire_coords
+            )
             f_11 = self._run_attn(
                 self.attn_11[layer_idx],
                 x_ln,
@@ -105,9 +185,9 @@ class CAPENLlama(_BaseLlama):
                 m_11,
                 relation="11",
                 probe=self._attn_probe_entry(layer_idx, "11"),
-                target_coordinates=wire_coords,
-                source_coordinates=wire_coords,
-                wire=wire,
+                target_coordinates=rot_coords,
+                source_coordinates=rot_coords,
+                wire=rotary,
             )
             f_21 = self._run_attn(
                 self.attn_21[layer_idx],

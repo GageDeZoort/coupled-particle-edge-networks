@@ -62,6 +62,7 @@ class JetClassStreamDatamodule(BaseDatamodule):
         n_val: int | None = None,
         n_test: int | None = None,
         shuffle_seed: int = 0,
+        shuffle_buffer: int | None = None,
         sort_by_pt: bool = False,
     ) -> None:
         super().__init__(data_root, batch_size, num_workers=num_workers)
@@ -71,6 +72,10 @@ class JetClassStreamDatamodule(BaseDatamodule):
         self.n_val_limit = n_val if n_val is not None else DEFAULT_N_VAL
         self.n_test_limit = n_test if n_test is not None else DEFAULT_N_TEST
         self.shuffle_seed = int(shuffle_seed)
+        # Streaming jobs walk ROOT in class-interleaved file order so a
+        # preempted run can skip the consumed prefix and continue. RAM subsets
+        # still shuffle via the map-style DataLoader.
+        self.shuffle_buffer = 0 if shuffle_buffer is None else int(shuffle_buffer)
         self.sort_by_pt = bool(sort_by_pt)
         self.n_particles = self.num_particles
         # Validate eagerly so a typo fails before any ROOT file is opened.
@@ -112,9 +117,27 @@ class JetClassStreamDatamodule(BaseDatamodule):
             sort_by_pt=self.sort_by_pt,
         )
 
+    def _ddp_identity(self) -> tuple[int, int]:
+        """(global_rank, world_size) from the Lightning trainer, else single-process."""
+        # ``self.trainer`` raises if the datamodule is not attached. Prefer the
+        # slot Lightning sets on attach; tests may also set a plain ``trainer``.
+        trainer = getattr(self, "_trainer", None) or vars(self).get("trainer")
+        if trainer is None:
+            return 0, 1
+        world = int(getattr(trainer, "world_size", 1) or 1)
+        rank = int(getattr(trainer, "global_rank", 0) or 0)
+        return rank, max(1, world)
+
+    def _apply_ddp_to_stream(self, dataset: JetClassStreamDataset) -> None:
+        """Stamp rank/world on the dataset before DataLoader workers pickle it."""
+        rank, world = self._ddp_identity()
+        dataset.ddp_rank = rank
+        dataset.ddp_world_size = world
+
     def _build_train_dataset(self) -> Dataset:
         self._ensure_dataset_stats()
         if self.streaming:
+            rank, world = self._ddp_identity()
             dataset = JetClassStreamDataset(
                 self.data_root,
                 "train",
@@ -122,15 +145,18 @@ class JetClassStreamDatamodule(BaseDatamodule):
                 num_particles=self.num_particles,
                 feature_config=self.feature_config,
                 chunk_size=chunk_size_for_workers(
-                    self.n_train_limit, self.num_workers
+                    self.n_train_limit, max(1, self.num_workers) * world
                 ),
                 shuffle_seed=self.shuffle_seed,
+                shuffle_buffer=self.shuffle_buffer,
                 sort_by_pt=self.sort_by_pt,
+                ddp_rank=rank,
+                ddp_world_size=world,
             )
             log_info(
                 f"[graphs] split=train mode=stream (single pass) "
                 f"n_jets={dataset.n_jets:,} features={self.feature_config} "
-                f"n_particles={self.num_particles}"
+                f"n_particles={self.num_particles} shuffle_buffer={self.shuffle_buffer}"
             )
             return dataset
         dataset = self._subset("train", int(self.n_train_limit))
@@ -176,26 +202,29 @@ class JetClassStreamDatamodule(BaseDatamodule):
         return kwargs
 
     def _resume_skip_jets(self) -> int:
-        """Jets already consumed this epoch, from a restored Lightning trainer."""
-        trainer = getattr(self, "trainer", None)
+        """Jets already consumed on this rank, from a restored Lightning trainer.
+
+        Uses ``global_step`` (optimizer steps across the whole run), not the
+        in-epoch batch counter. Streaming is a single pass: a preempted job
+        must continue through the ROOT files, not rewind to the epoch prefix.
+        """
+        trainer = getattr(self, "_trainer", None) or vars(self).get("trainer")
         if trainer is None:
             return 0
-        completed = 0
-        try:
-            completed = int(trainer.fit_loop.epoch_loop.batch_progress.current.completed)
-        except Exception:
-            completed = int(getattr(trainer, "global_step", 0) or 0)
-        return max(0, completed) * int(self.batch_size)
+        step = int(getattr(trainer, "global_step", 0) or 0)
+        return max(0, step) * int(self.batch_size)
 
     def train_dataloader(self) -> DataLoader:
         assert self._train is not None
         if isinstance(self._train, JetClassStreamDataset):
+            self._apply_ddp_to_stream(self._train)
             skip = self._resume_skip_jets()
             self._train.skip_jets = skip
             if skip:
+                rank, world = self._ddp_identity()
                 log_info(
                     f"[graphs] stream resume skip_jets={skip:,} "
-                    f"(batch_size={self.batch_size})"
+                    f"(batch_size={self.batch_size} rank={rank}/{world})"
                 )
             # Shuffling happens inside the worker's buffer; DataLoader must not
             # try to shuffle an IterableDataset.
@@ -203,11 +232,12 @@ class JetClassStreamDatamodule(BaseDatamodule):
         return DataLoader(self._train, shuffle=True, **self._dataloader_kwargs(self._train))
 
     def train_steps_per_epoch(self) -> int:
-        """Batches per training epoch, for schedulers and progress bars."""
+        """Batches per training epoch on each DDP rank."""
         assert self._train is not None
         n = int(getattr(self._train, "n_jets", len(self._train)))
         if isinstance(self._train, JetClassStreamDataset):
-            return steps_per_epoch(n, self.batch_size, self.num_workers)
+            _, world = self._ddp_identity()
+            return steps_per_epoch(n, self.batch_size, self.num_workers, world)
         return -(-n // self.batch_size)
 
     def _planned_size(self, split: str, limit: int | None) -> int:

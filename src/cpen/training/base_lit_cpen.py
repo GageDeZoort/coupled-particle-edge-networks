@@ -97,8 +97,9 @@ class BaseLitCPEN(L.LightningModule):
         live_graph_k: int | None = None,
         live_dense_pairs: bool = False,
         live_star_radius: float | None = None,
-        live_edge_features: str = "logdot-dp",
+        live_edge_features: str = "part-interaction",
         live_centroid_weight: str | None = None,
+        live_no_star_hyperedges: bool = False,
     ) -> None:
         super().__init__()
         self.model = model
@@ -123,8 +124,9 @@ class BaseLitCPEN(L.LightningModule):
         self.live_star_radius = live_star_radius
         self.live_edge_features = live_edge_features
         self.live_centroid_weight = live_centroid_weight
-        if live_star_radius is not None and live_graph_k is not None:
-            raise ValueError("live_star_radius and live_graph_k are mutually exclusive")
+        self.live_no_star_hyperedges = bool(live_no_star_hyperedges)
+        # live_star_radius + live_graph_k together ⇒ star hyperedges ∥ kNN 2-edges.
+        # live_no_star_hyperedges + live_graph_k ⇒ ΔR-kNN 2-edges only.
 
         self._build_task_metrics(int(model.out_dim))
 
@@ -216,10 +218,51 @@ class BaseLitCPEN(L.LightningModule):
         """
         if not isinstance(batch, dict):
             return batch
+        model = self._unwrap_model(self.model)
         if "x_raw" in batch:
             x_raw = batch.pop("x_raw")
             mask = batch["mask"]
-            if self.live_star_radius is not None:
+            if bool(getattr(model, "m11_only", False)):
+                n_ef = int(model.encoder_e.weight.size(1))
+                n_nodes = int(mask.size(-1))
+                n_batch = int(mask.size(0))
+                device = batch["x"].device
+                dtype = batch["x"].dtype
+                batch["edge_x"] = torch.zeros(
+                    n_batch, 1, n_ef, device=device, dtype=dtype
+                )
+                batch["incidence"] = torch.zeros(
+                    n_batch, 1, n_nodes, dtype=torch.bool, device=device
+                )
+                batch["edge_mask"] = torch.zeros(
+                    n_batch, 1, dtype=torch.bool, device=device
+                )
+            elif self.live_no_star_hyperedges and self.live_graph_k is not None:
+                from cpen.graphs.graph_star import build_delta_r_knn_edges
+
+                edge_x, incidence = build_delta_r_knn_edges(
+                    x_raw,
+                    k=int(self.live_graph_k),
+                    mask=mask,
+                    edge_features=self.live_edge_features,
+                    radius=float(self.live_star_radius or 0.2),
+                )
+                batch["edge_x"] = edge_x
+                batch["incidence"] = incidence
+            elif self.live_star_radius is not None and self.live_graph_k is not None:
+                from cpen.graphs.graph_star import build_star_plus_knn_graph
+
+                edge_x, incidence = build_star_plus_knn_graph(
+                    x_raw,
+                    radius=float(self.live_star_radius),
+                    k=int(self.live_graph_k),
+                    mask=mask,
+                    edge_features=self.live_edge_features,
+                    centroid_weight=self.live_centroid_weight,
+                )
+                batch["edge_x"] = edge_x
+                batch["incidence"] = incidence
+            elif self.live_star_radius is not None:
                 from cpen.graphs.graph_star import build_star_radius_graph
 
                 edge_x, incidence, _ = build_star_radius_graph(
@@ -239,7 +282,12 @@ class BaseLitCPEN(L.LightningModule):
                 batch["edge_x"] = build_dense_pairs(x_raw, mask)
             else:
                 raise RuntimeError("batch contains x_raw but no live graph mode is configured")
-        model = self._unwrap_model(self.model)
+        else:
+            x_raw = None
+        if x_raw is not None and bool(getattr(model, "use_rope", False)):
+            from cpen.apps.jets.part_kin import jet_centered_deta_dphi
+
+            batch["rope_coordinates"] = jet_centered_deta_dphi(x_raw, batch["mask"])
         if bool(getattr(model, "ignore_knn_edges", False)):
             from cpen.apps.jets.graph_hierarchical import drop_pairwise_edges_from_batch
             from cpen.utils.log_utils import log_info
@@ -298,6 +346,10 @@ class BaseLitCPEN(L.LightningModule):
             }
             if batch.get("wire_coordinates") is not None:
                 kwargs["wire_coordinates"] = batch["wire_coordinates"]
+            if batch.get("rope_coordinates") is not None:
+                kwargs["rope_coordinates"] = batch["rope_coordinates"]
+            if batch.get("x_raw") is not None:
+                kwargs["x_raw"] = batch["x_raw"]
             # Hierarchical / typed caches (CAPEN-Llama-att).
             if batch.get("edge_type") is not None:
                 kwargs["edge_type"] = batch["edge_type"]
@@ -435,12 +487,15 @@ class BaseLitCPEN(L.LightningModule):
         lr = self.model.get_lr(eta_0=self.eta_0, corr=self.corr)
         # Decoupled weight decay is AdamW-only; plain Adam uses L2-in-loss if wd>0.
         wd = self.weight_decay if self.optimizer_name == "adamw" else 0.0
+        params = [p for p in self.parameters() if p.requires_grad]
+        if not params:
+            raise ValueError("configure_optimizers: no trainable parameters")
         if self.optimizer_name == "adam":
-            opt = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=wd, eps=self.ADAM_EPS)
+            opt = torch.optim.Adam(params, lr=lr, weight_decay=wd, eps=self.ADAM_EPS)
         elif self.optimizer_name == "adamw":
-            opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=wd, eps=self.ADAM_EPS)
+            opt = torch.optim.AdamW(params, lr=lr, weight_decay=wd, eps=self.ADAM_EPS)
         elif self.optimizer_name == "sgd":
-            opt = torch.optim.SGD(self.parameters(), lr=lr, weight_decay=wd, momentum=0.9)
+            opt = torch.optim.SGD(params, lr=lr, weight_decay=wd, momentum=0.9)
         else:
             raise ValueError(f"Unknown optimizer {self.optimizer_name!r}")
 

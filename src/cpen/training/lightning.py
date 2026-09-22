@@ -31,6 +31,7 @@ class ParquetLoggerCallback(_ParquetLoggerCallback):
     _VAL_PRINT_KEYS = (
         "val_loss",
         "val_acc",
+        "val_sup_auroc",
         "val_auroc",
         "val_roc_auc",
         "val_node_loss",
@@ -166,6 +167,10 @@ def last_checkpoint_callback(
         "dirpath": run_dir,
         "filename": "last",
         "save_last": True,
+        # Without this, a pre-seeded ``last.ckpt`` (e.g. probe → s100k) causes
+        # Lightning to write ``last-v1.ckpt`` forever and leave the stale
+        # ``last.ckpt`` as the resume target.
+        "enable_version_counter": False,
     }
     if every_n_train_steps is not None and int(every_n_train_steps) > 0:
         kwargs["every_n_train_steps"] = int(every_n_train_steps)
@@ -191,6 +196,7 @@ def build_trainer(
     checkpoint_monitor: str = "val_loss",
     checkpoint_mode: str = "min",
     checkpoint_every_n_steps: int | None = None,
+    max_steps: int | None = None,
 ) -> L.Trainer:
     """Create a Lightning trainer with DDP, parquet logging, and resume checkpoints."""
     use_gpu = n_gpus > 0
@@ -221,6 +227,8 @@ def build_trainer(
             parquet_metadata["checkpoint_every_n_steps"] = int(
                 checkpoint_every_n_steps
             )
+        if max_steps is not None:
+            parquet_metadata["max_steps"] = int(max_steps)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     callbacks = [
@@ -239,6 +247,7 @@ def build_trainer(
             monitor=monitor,
             mode=mode,
             save_top_k=1,
+            enable_version_counter=False,
         ),
     ]
     if track_feature_movement:
@@ -261,8 +270,11 @@ def build_trainer(
         trainer_kwargs["val_check_interval"] = val_check_interval
     if limit_val_batches is not None:
         trainer_kwargs["limit_val_batches"] = limit_val_batches
+    if max_steps is not None and int(max_steps) > 0:
+        trainer_kwargs["max_steps"] = int(max_steps)
     if checkpoint_every_n_steps is not None and int(checkpoint_every_n_steps) > 0:
-        # Recreate the stream loader after resume so skip-ahead sees global_step.
+        # Recreate the stream loader after resume so skip-ahead sees global_step
+        # and continues through the ROOT files instead of replaying the prefix.
         trainer_kwargs["reload_dataloaders_every_n_epochs"] = 1
     return L.Trainer(**trainer_kwargs)
 
@@ -286,12 +298,53 @@ def checkpoint_compatible(ckpt_path: Path, module: torch.nn.Module) -> bool:
 
 
 def last_checkpoint_path(run_dir: Path) -> Path | None:
-    """Return path to last.ckpt if present."""
-    path = run_dir / "last.ckpt"
-    return path if path.exists() else None
+    """Return the newest ``last*.ckpt`` under *run_dir* (by ``global_step``).
+
+    Lightning's version counter can leave a stale ``last.ckpt`` beside newer
+    ``last-vN.ckpt`` files (e.g. after seeding a run dir from a probe). Resume
+    must follow the highest step, not the unversioned filename.
+    """
+    run_dir = Path(run_dir)
+    candidates = sorted(run_dir.glob("last*.ckpt"))
+    if not candidates:
+        return None
+
+    def _step(path: Path) -> int:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception:
+            return -1
+        try:
+            return int(payload.get("global_step", 0) or 0)
+        except Exception:
+            return -1
+
+    best = max(candidates, key=_step)
+    if _step(best) < 0:
+        plain = run_dir / "last.ckpt"
+        return plain if plain.exists() else candidates[-1]
+    return best
 
 
 def best_checkpoint_path(run_dir: Path) -> Path | None:
-    """Return path to best.ckpt if present."""
-    path = run_dir / "best.ckpt"
-    return path if path.exists() else None
+    """Return the newest ``best*.ckpt`` under *run_dir* (by ``global_step``)."""
+    run_dir = Path(run_dir)
+    candidates = sorted(run_dir.glob("best*.ckpt"))
+    if not candidates:
+        return None
+
+    def _step(path: Path) -> int:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception:
+            return -1
+        try:
+            return int(payload.get("global_step", 0) or 0)
+        except Exception:
+            return -1
+
+    best = max(candidates, key=_step)
+    if _step(best) < 0:
+        plain = run_dir / "best.ckpt"
+        return plain if plain.exists() else candidates[-1]
+    return best
