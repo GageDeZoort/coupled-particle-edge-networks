@@ -509,6 +509,62 @@ def fit_feature_stats(
 # --------------------------------------------------------------------------
 
 
+def blob_parquet_for_npz(npz_path: str | Path) -> Path:
+    """``…/graphs/blob_….npz`` → ``…/blobs/blob_….parquet`` sidecar."""
+    p = Path(npz_path)
+    return p.parent.parent / "blobs" / f"{p.stem}.parquet"
+
+
+def load_blob_stream_labels(npz_path: str | Path, *, n_stars: int) -> np.ndarray:
+    """Per-star ``stream_label`` from the blob parquet sidecar (object array)."""
+    from cpen.apps.streams.preprocess.config import BACKGROUND
+
+    pq = blob_parquet_for_npz(npz_path)
+    if not pq.is_file():
+        return np.full(int(n_stars), BACKGROUND, dtype=object)
+    tab = pd.read_parquet(pq, columns=["stream_label"])
+    labels = tab["stream_label"].astype(str).to_numpy()
+    if labels.size != int(n_stars):
+        out = np.full(int(n_stars), BACKGROUND, dtype=object)
+        n = min(int(n_stars), int(labels.size))
+        out[:n] = labels[:n]
+        return out
+    return labels
+
+
+def node_supervise_mask(
+    labels: np.ndarray,
+    holdout_streams: Sequence[str] | set[str] | frozenset[str] | None,
+) -> torch.Tensor:
+    """True where the star may enter CE (everything except holdout stream members)."""
+    if not holdout_streams:
+        return torch.ones(len(labels), dtype=torch.bool)
+    hold = {str(s) for s in holdout_streams}
+    ok = np.array([str(lab) not in hold for lab in labels], dtype=bool)
+    return torch.from_numpy(ok)
+
+
+def edge_supervise_mask_from_nodes(
+    incidence_node: torch.Tensor,
+    incidence_edge: torch.Tensor,
+    *,
+    n_edges: int,
+    node_ok: torch.Tensor,
+) -> torch.Tensor:
+    """Edge is supervised iff **every** incident node is supervised."""
+    if n_edges <= 0:
+        return torch.zeros(0, dtype=torch.bool)
+    edge_ok = torch.ones(int(n_edges), dtype=torch.bool)
+    if incidence_node.numel() == 0:
+        return edge_ok
+    nodes = incidence_node.to(torch.long)
+    edges = incidence_edge.to(torch.long)
+    bad = ~node_ok[nodes]
+    if bad.any():
+        edge_ok[edges[bad]] = False
+    return edge_ok
+
+
 def blob_to_incidence_payload(
     path: str | Path,
     *,
@@ -517,13 +573,21 @@ def blob_to_incidence_payload(
     drop_features: str | Sequence[str] | None = None,
     stats: dict[str, torch.Tensor] | None = None,
     include_hyperedges: bool = True,
+    holdout_streams: Sequence[str] | set[str] | frozenset[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """One blob ``.npz`` → CPEN COO incidence payload (unbatched).
 
     ``role`` is the split this graph belongs to (``train``/``val``/``test``).
-    Every star is labeled, so the whole graph sits in exactly one split mask;
-    the other two masks are all-False. That keeps the discovery pool
-    (``~train_mask``) equal to the full graph during val/test.
+
+    Default (no ``holdout_streams``): the whole graph sits in exactly one split
+    mask; the other two are all-False. Discovery pool ``~train_mask`` equals the
+    full graph on val/test.
+
+    With ``holdout_streams`` (label-holdout fine-tune): holdout members are
+    excluded from *all* split masks, so they never enter CE. On every role,
+    ``train_mask`` is set to the supervised (non-holdout) nodes so that
+    ``~train_mask`` is exactly the holdout members — discovery AUROC then
+    measures holdout recovery.
 
     Incidence concatenates kNN 2-edges and hyperedges. Each hyperedge is one
     incidence row of degree ``k_ball`` (~17); CPEN's sparse backend already
@@ -586,18 +650,51 @@ def blob_to_incidence_payload(
     if n_hyper > 0:
         is_hyper[n_knn:] = True
 
+    if holdout_streams:
+        labels = load_blob_stream_labels(path, n_stars=n_nodes)
+        node_ok = node_supervise_mask(labels, holdout_streams)
+        edge_ok = edge_supervise_mask_from_nodes(
+            incidence_node, incidence_edge, n_edges=n_edges, node_ok=node_ok
+        )
+        # Supervised CE masks by role; train_mask always = non-holdout so
+        # discovery AUROC (~train_mask) scores holdout recovery on every split.
+        train_m = node_ok
+        val_m = node_ok if role == "val" else node_none
+        test_m = node_ok if role == "test" else node_none
+        if role == "train":
+            val_m = node_none
+            test_m = node_none
+        elif role == "val":
+            # keep train_m = node_ok for discovery pool
+            pass
+        else:  # test
+            pass
+        e_train = edge_ok
+        e_val = edge_ok if role == "val" else edge_none
+        e_test = edge_ok if role == "test" else edge_none
+        if role == "train":
+            e_val = edge_none
+            e_test = edge_none
+    else:
+        train_m = node_all if role == "train" else node_none
+        val_m = node_all if role == "val" else node_none
+        test_m = node_all if role == "test" else node_none
+        e_train = edge_all if role == "train" else edge_none
+        e_val = edge_all if role == "val" else edge_none
+        e_test = edge_all if role == "test" else edge_none
+
     return {
         "x": x,
         "edge_x": edge_x,
         "y": y,
         "edge_y": edge_y,
         "mask": node_all,
-        "train_mask": node_all if role == "train" else node_none,
-        "val_mask": node_all if role == "val" else node_none,
-        "test_mask": node_all if role == "test" else node_none,
-        "edge_train_mask": edge_all if role == "train" else edge_none,
-        "edge_val_mask": edge_all if role == "val" else edge_none,
-        "edge_test_mask": edge_all if role == "test" else edge_none,
+        "train_mask": train_m,
+        "val_mask": val_m,
+        "test_mask": test_m,
+        "edge_train_mask": e_train,
+        "edge_val_mask": e_val,
+        "edge_test_mask": e_test,
         "incidence_node": incidence_node,
         "incidence_edge": incidence_edge,
         "incidence_nnz": torch.tensor(int(incidence_node.numel()), dtype=torch.int64),
@@ -626,6 +723,7 @@ class BlobGraphDataset(Dataset):
         include_edge_features: bool = True,
         include_hyperedges: bool = True,
         max_cache: int = 4096,
+        holdout_streams: Sequence[str] | set[str] | frozenset[str] | None = None,
     ) -> None:
         if split not in SPLITS:
             raise ValueError(f"split must be train|val|test; got {split!r}")
@@ -638,6 +736,9 @@ class BlobGraphDataset(Dataset):
         self.include_edge_features = include_edge_features
         self.include_hyperedges = bool(include_hyperedges)
         self.max_cache = int(max_cache)
+        self.holdout_streams = (
+            frozenset(str(s) for s in holdout_streams) if holdout_streams else None
+        )
         self._cache: dict[int, dict[str, torch.Tensor]] = {}
 
     def __len__(self) -> int:
@@ -659,6 +760,7 @@ class BlobGraphDataset(Dataset):
             drop_features=self.drop_features,
             stats=self.stats,
             include_hyperedges=self.include_hyperedges,
+            holdout_streams=self.holdout_streams,
         )
         if len(self._cache) < self.max_cache:
             self._cache[index] = payload

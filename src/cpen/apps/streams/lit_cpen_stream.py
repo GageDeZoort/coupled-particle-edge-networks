@@ -24,9 +24,13 @@ class LitCPENStream(BaseLitCPEN):
       - ``hard+product``: hard CE plus the consistency term (blob default)
 
     Discovery (logged every val/test pass)
-      - node AUROC on ``~train_mask``
+      - ``*_sup_auroc``: node AUROC on the CE mask (supervised stars)
+      - ``*_auroc``: node AUROC on ``~train_mask`` (discovery / holdout pool)
       - edge AUROC on ``~edge_train_mask`` (kNN + hyperedges together)
       - hyper AUROC on hyperedges in that pool, when present
+
+    Mask-holdout fine-tunes checkpoint on ``val_sup_auroc`` (discovery AUROC is
+    often degenerate on val cells with few holdout members).
     """
 
     def __init__(
@@ -66,8 +70,13 @@ class LitCPENStream(BaseLitCPEN):
         self.train_edge_acc = MulticlassAccuracy(num_classes=out_dim)
         self.val_edge_acc = MulticlassAccuracy(num_classes=out_dim)
         self.test_edge_acc = MulticlassAccuracy(num_classes=out_dim)
+        # Discovery pool (~train_mask): unlabeled / holdout members.
         self.val_auroc = BinaryAUROC()
         self.test_auroc = BinaryAUROC()
+        # Supervised pool (CE mask): train-stream + background — use for
+        # mask-holdout checkpointing where discovery AUROC is often degenerate.
+        self.val_sup_auroc = BinaryAUROC()
+        self.test_sup_auroc = BinaryAUROC()
         self.val_edge_auroc = BinaryAUROC()
         self.test_edge_auroc = BinaryAUROC()
         self.val_hyper_auroc = BinaryAUROC()
@@ -192,8 +201,13 @@ class LitCPENStream(BaseLitCPEN):
         node_logits: torch.Tensor,
         edge_logits: torch.Tensor,
         batch: dict[str, torch.Tensor],
+        edge_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int]:
-        """BCE-with-logits against stopgrad node-derived soft targets (B=1)."""
+        """BCE-with-logits against stopgrad node-derived soft targets (B=1).
+
+        When ``edge_mask`` is given, only supervised edges contribute (needed for
+        label-holdout fine-tune so holdout endpoints cannot leak via consistency).
+        """
         if node_logits.size(0) != 1 or edge_logits.size(0) != 1:
             raise ValueError(
                 "product-consistency currently expects batch_size=1 stream graphs; "
@@ -204,6 +218,16 @@ class LitCPENStream(BaseLitCPEN):
             return edge_logits.sum() * 0.0, 0
         target = self._soft_edge_targets(node_logits, batch, n_edges)
         edge_logit = edge_logits[0, :, 1] - edge_logits[0, :, 0]
+        if edge_mask is not None:
+            m = edge_mask.to(torch.bool).reshape(-1)
+            if m.numel() != n_edges:
+                raise ValueError(
+                    f"edge_mask length {m.numel()} != n_edges={n_edges}"
+                )
+            if not bool(m.any()):
+                return edge_logits.sum() * 0.0, 0
+            loss = F.binary_cross_entropy_with_logits(edge_logit[m], target[m])
+            return loss, int(m.sum().item())
         loss = F.binary_cross_entropy_with_logits(edge_logit, target)
         return loss, n_edges
 
@@ -239,7 +263,9 @@ class LitCPENStream(BaseLitCPEN):
 
         use_cons = self.edge_aux in {"product-consistency", "hard+product"}
         cons_loss, n_edges_cons = (
-            self._product_consistency_loss(node_logits, edge_logits, batch)
+            self._product_consistency_loss(
+                node_logits, edge_logits, batch, edge_mask=edge_mask
+            )
             if use_cons
             else (edge_logits.sum() * 0.0, 0)
         )
@@ -331,6 +357,15 @@ class LitCPENStream(BaseLitCPEN):
                     batch_size=n_nodes,
                     sync_dist=True,
                 )
+                # Supervised-node AUROC (CE mask) — primary monitor for mask-holdout.
+                self.val_sup_auroc(node_probs[:, 1], node_targets)
+                self.log(
+                    "val_sup_auroc",
+                    self.val_sup_auroc,
+                    on_epoch=True,
+                    batch_size=n_nodes,
+                    sync_dist=True,
+                )
             if n_edges_sup > 0:
                 self.val_edge_acc(edge_probs, edge_targets)
                 self.log(
@@ -407,6 +442,14 @@ class LitCPENStream(BaseLitCPEN):
                 self.log(
                     "test_mean_p_stream",
                     node_probs[:, 1].mean(),
+                    on_epoch=True,
+                    batch_size=n_nodes,
+                    sync_dist=True,
+                )
+                self.test_sup_auroc(node_probs[:, 1], node_targets)
+                self.log(
+                    "test_sup_auroc",
+                    self.test_sup_auroc,
                     on_epoch=True,
                     batch_size=n_nodes,
                     sync_dist=True,

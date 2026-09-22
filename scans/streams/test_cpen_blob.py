@@ -118,6 +118,58 @@ def add_blob_args(parser: argparse.ArgumentParser) -> None:
         default=4096,
         help="Max payloads held in memory per dataset. Default: 4096.",
     )
+    parser.add_argument(
+        "--blob-cell-split",
+        action="store_true",
+        help="Legacy real fine-tune: supervise only cells that contain train "
+        "streams; all other cells are discovery test. Prefer "
+        "--blob-mask-holdout. Requires --blob-galaxies with one id "
+        "(default 0000) under data_root/train/.",
+    )
+    parser.add_argument(
+        "--blob-mask-holdout",
+        action="store_true",
+        help="Preferred real fine-tune: train on all non-val cells; mask "
+        "holdout stream *labels* from node/edge CE (sky kept). Discovery "
+        "AUROC = recovery on holdout members (~train_mask). Mutually "
+        "exclusive with --blob-cell-split.",
+    )
+    parser.add_argument(
+        "--blob-train-streams",
+        type=str,
+        default=None,
+        help="Comma-separated train stream names. Default: all streams present "
+        "except --blob-holdout-streams (TEST_REAL_STREAMS).",
+    )
+    parser.add_argument(
+        "--blob-holdout-streams",
+        type=str,
+        default=None,
+        help="Comma-separated holdout stream names for discovery. Default: "
+        "Elqui,Chenab,Indus,Phoenix,AAU. For L1SO pass a single name.",
+    )
+    parser.add_argument(
+        "--blob-min-train-stream-stars",
+        type=int,
+        default=1,
+        help="Min train-stream members for a cell to count as a train cell. "
+        "Default: 1.",
+    )
+    parser.add_argument(
+        "--blob-cell-val-frac",
+        type=float,
+        default=0.15,
+        help="Fraction of train-stream cells held out for val (not discovery). "
+        "Default: 0.15.",
+    )
+    parser.add_argument(
+        "--train-last-blocks",
+        type=int,
+        default=0,
+        help="After --init-from, freeze encoder + early CPEN blocks and train "
+        "only the last N residual blocks plus decoder_x/decoder_e. "
+        "0 (default) = full fine-tune. 1 = last block + readout.",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,6 +203,14 @@ def main() -> None:
     dm_box: dict = {}
 
     def datamodule_factory():
+        use_cell = bool(getattr(args, "blob_cell_split", False))
+        use_mask = bool(getattr(args, "blob_mask_holdout", False))
+        if use_cell and use_mask:
+            raise SystemExit(
+                "Pass only one of --blob-cell-split / --blob-mask-holdout"
+            )
+        if (use_cell or use_mask) and not args.blob_galaxies:
+            args.blob_galaxies = "0000"
         dm = BlobStreamDatamodule(
             data_root=data_root,
             batch_size=1,
@@ -169,13 +229,21 @@ def main() -> None:
             include_edge_features=True,
             include_hyperedges=not bool(args.blob_no_hyperedges),
             max_cache=int(args.blob_max_cache),
+            cell_split=use_cell,
+            mask_holdout=use_mask,
+            train_streams=getattr(args, "blob_train_streams", None),
+            holdout_streams=getattr(args, "blob_holdout_streams", None),
+            min_train_stream_stars=int(getattr(args, "blob_min_train_stream_stars", 1) or 1),
+            cell_val_frac=float(getattr(args, "blob_cell_val_frac", 0.15) or 0.0),
         )
         dm_box["dm"] = dm
         return dm
 
     def lit_factory(model, **kwargs):
+        from cpen.apps.streams.init_from import freeze_except_last_blocks, load_init_checkpoint
+
         dm = dm_box.get("dm")
-        return LitCPENStream(
+        lit = LitCPENStream(
             model,
             class_weights=None if dm is None else dm.class_weights,
             edge_class_weights=None if dm is None else dm.edge_class_weights,
@@ -183,6 +251,13 @@ def main() -> None:
             edge_aux=str(getattr(args, "edge_aux", "hard-ce") or "hard-ce"),
             **kwargs,
         )
+        init_from = getattr(args, "init_from", None)
+        if init_from:
+            load_init_checkpoint(lit, init_from)
+        n_last = int(getattr(args, "train_last_blocks", 0) or 0)
+        if n_last > 0:
+            freeze_except_last_blocks(lit.model, n_blocks=n_last)
+        return lit
 
     run_sweep(
         args,
