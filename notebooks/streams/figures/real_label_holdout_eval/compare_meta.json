@@ -1,0 +1,24 @@
+{
+  "device": "cuda",
+  "holdout": [
+    "AAU",
+    "Chenab",
+    "Elqui",
+    "Indus",
+    "Phoenix"
+  ],
+  "runs": {
+    "mock": {
+      "run_dir": "/scratch/gpfs/BHANIN/jdezoort/cpen_runs/blobs/stream_output/adamw/sweep_lr/cpen_4_256_0p2_t5_ln_cosine_op-incidence_onorm-degree_res-transformer-like_drop0p2_nf6_gnativeedges_blobs-dropparallax-hyper-edgecons",
+      "t_star": 0.1
+    },
+    "full_ft": {
+      "run_dir": "/scratch/gpfs/BHANIN/jdezoort/cpen_runs/blobs_real_mask/stream_output/adamw/sweep_lr/cpen_4_256_0p01_t100_ln_cosine_op-incidence_onorm-degree_res-transformer-like_nf6_gnativeedges_blobs-rich10-dropparallax-hyper-maskholdout-g0000-initfrom-edgecons",
+      "t_star": 0.5499999999999999
+    },
+    "lastblock_ft": {
+      "run_dir": "/scratch/gpfs/BHANIN/jdezoort/cpen_runs/blobs_real_mask_lastblock/stream_output/adamw/sweep_lr/cpen_4_256_0p01_t100_ln_cosine_op-incidence_onorm-degree_res-transformer-like_nf6_gnativeedges_blobs-rich10-dropparallax-hyper-maskholdout-g0000-initfrom-lastblock1-edgecons",
+      "t_star": 0.3
+    }
+  }
+}
