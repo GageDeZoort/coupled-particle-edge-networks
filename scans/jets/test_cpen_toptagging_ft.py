@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
         star_radius=0.2,
         live_knn_k=6,
         num_particles=80,
-        checkpoint_monitor="val_auroc",
+        checkpoint_monitor="val_roc_auc",
         checkpoint_mode="max",
     )
     return parser.parse_args()

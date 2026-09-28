@@ -309,6 +309,21 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
         tags.append(run_tag)
     if tags:
         kwargs["extra_tag"] = "_".join(tags)
+    # Tag step-schedule lengths so different (warmup, flat, cosine) arms
+    # never resume each other. Scheduler name itself is already in RunOptions.
+    if str(getattr(args, "scheduler", "none") or "none") == "warmup_flat_cosine":
+        from cpen.utils.run_tags import format_count
+
+        w = int(getattr(args, "warmup_steps", 0) or 0)
+        f = int(getattr(args, "flat_steps", 0) or 0)
+        c = getattr(args, "cosine_steps", None)
+        c_tok = format_count(int(c)) if c is not None else "auto"
+        frac = float(getattr(args, "lr_decay_min_frac", 0.005) or 0.005)
+        from cpen.utils.run_tags import format_eta
+
+        sched_tag = f"w{format_count(w)}f{format_count(f)}c{c_tok}min{format_eta(frac)}"
+        prev = kwargs.get("extra_tag")
+        kwargs["extra_tag"] = f"{prev}_{sched_tag}" if prev else sched_tag
     return replace(opts, **kwargs)
 
 
@@ -337,6 +352,21 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
                 if name not in choices:
                     choices.append(name)
             action.choices = choices
+        elif getattr(action, "dest", None) == "scheduler" and action.choices is not None:
+            choices = list(action.choices)
+            if "warmup_flat_cosine" not in choices:
+                choices.append("warmup_flat_cosine")
+            action.choices = choices
+            action.help = (
+                "LR schedule: 'none', epoch 'cosine', or step "
+                "'warmup_flat_cosine' (linear warmup → flat → cosine to "
+                "lr_decay_min_frac × peak LR). Peak LR is η₀/√D."
+            )
+        elif getattr(action, "dest", None) == "lr_decay_min_frac":
+            action.help = (
+                "Cosine floor as a fraction of the peak LR (η₀/√D), not of η₀. "
+                "Used by --scheduler cosine and warmup_flat_cosine. Default: 0.005."
+            )
         elif getattr(action, "dest", None) == "estimate_gamma_rs":
             action.default = True
             action.help = (
@@ -367,6 +397,38 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
                 "Global RNG seed (Lightning seed_everything, including "
                 "DataLoader workers). Tagged in Pascal run names as seed{N}."
             )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        dest="warmup_steps",
+        help=(
+            "Linear LR warmup length in optimizer steps for "
+            "--scheduler warmup_flat_cosine. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--flat-steps",
+        type=int,
+        default=0,
+        dest="flat_steps",
+        help=(
+            "Constant-peak LR length in optimizer steps after warmup for "
+            "--scheduler warmup_flat_cosine. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--cosine-steps",
+        type=int,
+        default=None,
+        dest="cosine_steps",
+        help=(
+            "Cosine anneal length in optimizer steps for "
+            "--scheduler warmup_flat_cosine (floor = lr_decay_min_frac × peak LR). "
+            "Use ≥ one unique pass: ceil(n_train / (batch_size × n_gpus)). "
+            "Required when scheduler is warmup_flat_cosine."
+        ),
+    )
     parser.add_argument(
         "--corr",
         type=float,
@@ -1028,7 +1090,8 @@ def create_jetclass_datamodule(args, *, data_root):  # type: ignore[no-untyped-d
             shuffle_seed=int(getattr(args, "seed", 0) or 0),
             sort_by_pt=bool(getattr(args, "jetclass_sort_by_pt", False)),
         )
-    # Bytecode train_one_run reads dm.corr_adam / corr_sgd into LitCPEN.corr.
+    # Bytecode train_one_run reads dm.corr_adam / corr_sgd into LitCPEN.corr
+    # *after* dm.setup(). Stream/cache DMs must not reset these in setup.
     corr = float(getattr(args, "corr", 1.0) or 1.0)
     dm.corr_adam = corr
     dm.corr_sgd = corr
@@ -1534,6 +1597,29 @@ def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
             return base_factory(*factory_args, **factory_kwargs)
 
         kwargs["lit_factory"] = lit_factory_live
+
+    # Bytecode train_one_run only forwards scheduler / lr_decay_min_frac; the
+    # step warmup→flat→cosine schedule needs these lengths on the Lit module.
+    if str(getattr(args, "scheduler", "none") or "none") == "warmup_flat_cosine":
+        cosine_steps = getattr(args, "cosine_steps", None)
+        if cosine_steps is None or int(cosine_steps) <= 0:
+            raise ValueError(
+                "--scheduler warmup_flat_cosine requires --cosine-steps > 0 "
+                "(typically ceil(n_train / (batch_size × n_gpus)) for one unique pass)"
+            )
+        sched_kwargs = {
+            "warmup_steps": int(getattr(args, "warmup_steps", 0) or 0),
+            "flat_steps": int(getattr(args, "flat_steps", 0) or 0),
+            "cosine_steps": int(cosine_steps),
+        }
+        if "lit_factory" in kwargs:
+            inner_sched = kwargs["lit_factory"]
+
+            def lit_factory_sched(*factory_args, **factory_kwargs):
+                factory_kwargs.update(sched_kwargs)
+                return inner_sched(*factory_args, **factory_kwargs)
+
+            kwargs["lit_factory"] = lit_factory_sched
 
     # Weights-only warm start (never loads optimizer / global_step from pretrain).
     if init_from and "lit_factory" in kwargs:

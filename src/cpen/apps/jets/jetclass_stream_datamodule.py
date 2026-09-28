@@ -102,9 +102,11 @@ class JetClassStreamDatamodule(BaseDatamodule):
     def _ensure_dataset_stats(self) -> None:
         if getattr(self, "_stats_loaded", False):
             return
-        stats = get_dataset_stats("jetclass")
-        self.corr_adam = stats.corr_adam
-        self.corr_sgd = stats.corr_sgd
+        # DatasetStats.corr_* are legacy defaults (always 1.0 for JetClass).
+        # CLI ``--corr`` is written onto the DM in create_jetclass_datamodule
+        # *before* bytecode train_one_run calls setup(); do not clobber it here
+        # or LitCPEN is built with corr=1 and embedding LR correction is a no-op.
+        get_dataset_stats("jetclass")
         self._stats_loaded = True
 
     def _subset(self, split: str, n_jets: int) -> Dataset:

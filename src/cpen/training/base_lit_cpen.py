@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import lightning as L
@@ -10,7 +11,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torchmetrics.classification import MulticlassAccuracy
 from torchmetrics import MeanMetric
 from torchmetrics.functional.classification.accuracy import _accuracy_reduce
@@ -18,6 +19,39 @@ from torchmetrics.functional.classification.accuracy import _accuracy_reduce
 from cpen.utils.graphs import adjacency_from_batch, build_dense_pairs, build_knn_graph, pairwise_from_batch
 from cpen.utils.sparse_incidence import attach_sparse_incidence_batch
 from cpen.utils.metrics import should_compute_heavy_metrics
+
+
+def warmup_flat_cosine_multiplier(
+    step: int,
+    *,
+    warmup_steps: int,
+    flat_steps: int,
+    cosine_steps: int,
+    min_frac: float,
+) -> float:
+    """Step LR scale: linear warmup → flat → cosine down to ``min_frac``.
+
+    ``step`` is the LambdaLR counter (0 on the first ``scheduler.step()`` after
+    the first optimizer update). Floor is ``min_frac`` × peak LR — i.e. a
+    fraction of ``η₀/√D``, not of ``η₀``.
+    """
+    if warmup_steps < 0 or flat_steps < 0 or cosine_steps <= 0:
+        raise ValueError(
+            f"warmup/flat/cosine steps must be non-negative with cosine>0; "
+            f"got {warmup_steps}/{flat_steps}/{cosine_steps}"
+        )
+    if not (0.0 <= min_frac <= 1.0):
+        raise ValueError(f"min_frac must be in [0, 1]; got {min_frac}")
+    if step < warmup_steps:
+        # Avoid a literal zero LR on the first step when warmup_steps > 0.
+        return float(step + 1) / float(warmup_steps) if warmup_steps > 0 else 1.0
+    if step < warmup_steps + flat_steps:
+        return 1.0
+    t = step - warmup_steps - flat_steps
+    if t >= cosine_steps:
+        return float(min_frac)
+    progress = float(t) / float(cosine_steps)
+    return float(min_frac + 0.5 * (1.0 - min_frac) * (1.0 + math.cos(math.pi * progress)))
 
 
 def background_rejection_at_efficiency(
@@ -100,6 +134,9 @@ class BaseLitCPEN(L.LightningModule):
         live_edge_features: str = "part-interaction",
         live_centroid_weight: str | None = None,
         live_no_star_hyperedges: bool = False,
+        warmup_steps: int = 0,
+        flat_steps: int = 0,
+        cosine_steps: int | None = None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -118,6 +155,9 @@ class BaseLitCPEN(L.LightningModule):
         self.lambda_0 = lambda_0
         self.run_options = run_options or {}
         self.bg_rejection_signal_class = bg_rejection_signal_class
+        self.warmup_steps = int(warmup_steps)
+        self.flat_steps = int(flat_steps)
+        self.cosine_steps = None if cosine_steps is None else int(cosine_steps)
         self.heavy_metrics_frac = heavy_metrics_frac
         self.live_graph_k = live_graph_k
         self.live_dense_pairs = live_dense_pairs
@@ -541,9 +581,35 @@ class BaseLitCPEN(L.LightningModule):
                 eta_min=self.lr_decay_min_frac * base_lr,
             )
             return {"optimizer": opt, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+        if self.scheduler_name == "warmup_flat_cosine":
+            cosine_steps = self.cosine_steps
+            if cosine_steps is None or cosine_steps <= 0:
+                raise ValueError(
+                    "scheduler=warmup_flat_cosine requires cosine_steps > 0 "
+                    "(one unique pass over the training set at the global batch)"
+                )
+            warm = self.warmup_steps
+            flat = self.flat_steps
+            min_frac = float(self.lr_decay_min_frac)
+
+            def lr_lambda(step: int) -> float:
+                return warmup_flat_cosine_multiplier(
+                    step,
+                    warmup_steps=warm,
+                    flat_steps=flat,
+                    cosine_steps=int(cosine_steps),
+                    min_frac=min_frac,
+                )
+
+            scheduler = LambdaLR(opt, lr_lambda=lr_lambda)
+            return {
+                "optimizer": opt,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+            }
         return opt
 
     def static_metadata(self) -> dict[str, Any]:
+        scheduled = self.scheduler_name in {"cosine", "warmup_flat_cosine"}
         meta = {
             "model": self.model_name,
             "dataset": self.dataset,
@@ -555,10 +621,14 @@ class BaseLitCPEN(L.LightningModule):
             "weight_decay": self.weight_decay,
             "adam_eps": self.ADAM_EPS if self.optimizer_name in {"adam", "adamw"} else None,
             "scheduler": self.scheduler_name,
-            "lr_decay_min_frac": self.lr_decay_min_frac if self.scheduler_name == "cosine" else None,
+            "lr_decay_min_frac": self.lr_decay_min_frac if scheduled else None,
             "corr": self.corr,
             "heavy_metrics_frac": self.heavy_metrics_frac,
         }
+        if self.scheduler_name == "warmup_flat_cosine":
+            meta["warmup_steps"] = self.warmup_steps
+            meta["flat_steps"] = self.flat_steps
+            meta["cosine_steps"] = self.cosine_steps
         if self.t_epoch is not None:
             meta["t_epoch"] = self.t_epoch
         if self.lambda_0 is not None:

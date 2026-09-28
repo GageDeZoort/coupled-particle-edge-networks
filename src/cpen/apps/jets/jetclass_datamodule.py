@@ -101,9 +101,8 @@ class JetClassLiteStarDatamodule(BaseDatamodule):
     def _ensure_dataset_stats(self) -> None:
         if getattr(self, "_stats_loaded", False):
             return
-        stats = get_dataset_stats("jetclass")
-        self.corr_adam = stats.corr_adam
-        self.corr_sgd = stats.corr_sgd
+        # Do not overwrite corr_adam/corr_sgd — CLI --corr is set before setup().
+        get_dataset_stats("jetclass")
         Path(self.data_root).mkdir(parents=True, exist_ok=True)
         self._stats_loaded = True
 

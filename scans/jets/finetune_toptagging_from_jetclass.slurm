@@ -104,6 +104,6 @@ python test_cpen_toptagging_ft.py \
   --check-val-every-n-epoch 1 \
   --val-check-interval 500 \
   --checkpoint-every-n-steps 500 \
-  --checkpoint-monitor val_auroc \
+  --checkpoint-monitor val_roc_auc \
   --checkpoint-mode max \
   --no-torch-compile

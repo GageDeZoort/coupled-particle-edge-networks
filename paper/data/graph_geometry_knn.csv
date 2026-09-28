@@ -1,0 +1,13 @@
+k,class,n_edges_mean,frac_mean,source
+1,QCD,43.919998,0.029086,knn_graph_study
+2,QCD,87.839996,0.058171,knn_graph_study
+4,QCD,175.679993,0.116343,knn_graph_study
+6,QCD,263.519988,0.174514,knn_graph_study_k1_scaled
+8,QCD,351.354004,0.232485,knn_graph_study
+16,QCD,701.669495,0.456045,knn_graph_study
+1,top,55.123001,0.019728,knn_graph_study
+2,top,110.246002,0.039456,knn_graph_study
+4,top,220.492004,0.078912,knn_graph_study
+6,top,330.738006,0.118368,knn_graph_study_k1_scaled
+8,top,440.984009,0.157823,knn_graph_study
+16,top,881.968018,0.315646,knn_graph_study

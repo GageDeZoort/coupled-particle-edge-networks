@@ -69,6 +69,8 @@ class RunOptions:
             parts.append(f"{self.decoder.replace('_', '-')}-dec")
         if self.scheduler == "cosine":
             parts.append("cosine")
+        elif self.scheduler == "warmup_flat_cosine":
+            parts.append("wfc")
         if self.operators != "identity":
             op_token = self.operators.replace(",", "-").replace("_", "-")
             parts.append(f"op-{op_token}")
