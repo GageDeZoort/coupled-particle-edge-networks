@@ -12,39 +12,25 @@ JET_RUNS = Path("/scratch/gpfs/BHANIN/jdezoort/cpen_runs/jetclass_runs/jetclass_
 LOGS = Path("/scratch/gpfs/BHANIN/jdezoort/cpen_runs/jetclass_scaling_law/logs")
 OUT = Path(__file__).resolve().parent
 
-# Canonical M11 vs edges (L=3, D=256, 1M, 1 epoch) from paper viz / jetclass_runs.
-M11_VS_EDGES = [
-    # model, eta0, val_acc, val_roc_auc, val_bg_rejection
-    ("edges", 0.01, 0.565920, 0.906638, 111.381),
-    ("edges", 0.05, 0.598080, 0.921038, 124.559),
-    ("edges", 0.10, 0.610480, 0.925185, 121.763),
-    ("edges", 0.25, 0.610360, 0.926301, 120.656),
-    ("edges", 0.50, 0.615240, 0.926166, 130.398),
-    ("edges", 1.00, 0.601840, 0.923868, 130.405),
-    ("edges", 2.50, 0.557400, 0.906729, 119.866),
-    ("m11", 0.01, 0.554880, 0.902637, 90.730),
-    ("m11", 0.05, 0.584600, 0.915338, 105.613),
-    ("m11", 0.10, 0.595120, 0.919282, 103.411),
-    ("m11", 0.25, 0.590920, 0.920145, 109.923),
-    ("m11", 0.50, 0.598880, 0.921783, 91.770),
-    ("m11", 1.00, 0.575600, 0.913964, 94.475),
-    ("m11", 2.50, 0.531600, 0.897734, 87.788),
-]
+# Canonical M11 vs edges (L=3) — archived 2026-09-28; not matched to B=64 recipe.
+# See paper/archive/graph_construction_2026-09-28/data/edges_vs_m11_1m.csv
+M11_VS_EDGES: list = []
 
 
 def collect_edges_vs_m11() -> pd.DataFrame:
-    rows = [
-        dict(model=m, eta0=e, val_acc=a, val_roc_auc=r, val_bg_rejection=j)
-        for m, e, a, r, j in M11_VS_EDGES
-    ]
-    return pd.DataFrame(rows)
+    """Placeholder: old L=3 edges/M11 table archived (batch not matched to B=64 recipe)."""
+    print("[warn] edges_vs_m11: rematch at B=64 not started; writing empty CSV")
+    return pd.DataFrame(
+        columns=["model", "eta0", "val_acc", "val_roc_auc", "val_bg_rejection"]
+    )
 
 
 def collect_graph_ablation() -> pd.DataFrame:
-    """Graph-construction ablations only (no RoPE / pooling / pT-cut)."""
+    """Matched B=64 / 15625-step / part-int graph ablations (ablate-Rmig-b64)."""
     rows = []
+    tag = "ablate-Rmig-b64"
 
-    def add(pqf: Path, family: str, variant: str, panel: str) -> None:
+    def add(pqf: Path, family: str, variant: str, panel: str, **extra) -> None:
         df = pq.read_table(pqf).to_pandas()
         v = df.dropna(subset=["val_roc_auc"]).sort_values("global_step")
         if len(v) == 0:
@@ -55,52 +41,41 @@ def collect_graph_ablation() -> pd.DataFrame:
             global_step=int(r.global_step), val_acc=float(r.val_acc),
             val_roc_auc=float(r.val_roc_auc),
             val_bg_rejection=float(r.val_bg_rejection), path=str(pqf),
+            **extra,
         ))
 
-    # Matched 2-epoch B=256: kNN + nostar + default knn6
-    panel_b = [
-        ("connectivity", "kNN $k=2$", "knn2-D1M-s3p907k"),
-        ("connectivity", "kNN $k=4$", "knn4-D1M-s3p907k"),
-        ("connectivity", "kNN $k=6$", "knn6-D1M-s3p907k"),
-        ("connectivity", "kNN $k=8$", "knn8-D1M-s3p907k"),
-        ("star graph", "no star", "knn6-nostar-D1M-s3p907k"),
+    # kNN + no-star at fixed R★=0.2
+    panel_k = [
+        ("connectivity", "kNN $k=2$", "knn2-D1M-s15p625k", False),
+        ("connectivity", "kNN $k=4$", "knn4-D1M-s15p625k", False),
+        ("connectivity", "kNN $k=6$", "knn6-D1M-s15p625k", False),
+        ("connectivity", "kNN $k=8$", "knn8-D1M-s15p625k", False),
+        ("connectivity", "kNN $k=10$", "knn10-D1M-s15p625k", False),
+        ("star graph", "no star", "knn6-nostar-D1M-s15p625k", True),
     ]
-    for family, variant, token in panel_b:
-        hits = sorted(ADAM_SWEEP.glob(f"capen-llama-att_4_256_*{token}*ablate*.parquet"))
-        if "k=6" in variant:
+    for family, variant, token, want_nostar in panel_k:
+        hits = sorted(ADAM_SWEEP.glob(
+            f"capen-llama-att_4_256_*gstar0p2_stream-kin7-partint*{token}*seed0-{tag}.parquet"
+        ))
+        if want_nostar:
+            hits = [h for h in hits if "nostar" in h.name]
+        else:
             hits = [h for h in hits if "nostar" not in h.name]
         if not hits:
             print(f"[warn] missing {variant}"); continue
         add(hits[0], family, variant, "graph_matched")
 
-    # Matched 1-epoch star-radius sweep (no part-int; same otherwise).
-    # R★=0.2 is the "no pairwise part-int" run at gstar0p2.
-    star_r = [
-        (0.10, "gstar0p1_stream-kin7-p80-D1M-s1p954k-seed0-ablate"),
-        (0.15, "gstar0p15_stream-kin7-p80-D1M-s1p954k-seed0-ablate"),
-        (0.20, "gstar0p2_stream-kin7-p80-D1M-s1p954k-seed0-ablate"),
-        (0.30, "gstar0p3_stream-kin7-p80-D1M-s1p954k-seed0-ablate"),
-    ]
-    for r_star, token in star_r:
-        hits = sorted(ADAM_SWEEP.glob(f"capen-llama-att_4_256_*{token}*.parquet"))
-        hits = [h for h in hits
-                if "unipool" not in h.name and "logdot" not in h.name
-                and "fullm22" not in h.name and "partint" not in h.name
-                and "rope" not in h.name]
+    # Star radius at fixed k=6 + part-int
+    star_r = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35]
+    for r_star in star_r:
+        r_tag = f"{r_star:g}".replace(".", "p")
+        hits = sorted(ADAM_SWEEP.glob(
+            f"capen-llama-att_4_256_*gstar{r_tag}_stream-kin7-partint*knn6-D1M-s15p625k*seed0-{tag}.parquet"
+        ))
+        hits = [h for h in hits if "nostar" not in h.name and "knn10" not in h.name]
         if not hits:
             print(f"[warn] missing R★={r_star}"); continue
-        df = pq.read_table(hits[0]).to_pandas()
-        v = df.dropna(subset=["val_roc_auc"]).sort_values("global_step")
-        if len(v) == 0:
-            continue
-        r = v.iloc[-1]
-        rows.append(dict(
-            panel="star_radius", family="star radius",
-            variant=f"R={r_star:g}", r_star=r_star,
-            global_step=int(r.global_step), val_acc=float(r.val_acc),
-            val_roc_auc=float(r.val_roc_auc),
-            val_bg_rejection=float(r.val_bg_rejection), path=str(hits[0]),
-        ))
+        add(hits[0], "star radius", f"R={r_star:g}", "star_radius", r_star=r_star)
 
     return pd.DataFrame(rows)
 

@@ -16,3 +16,6 @@ logs/
 *.out
 *#*
 *~*
+# Local-only superseded graph-construction artifacts
+scans/jets/archive/
+paper/archive/

@@ -274,6 +274,7 @@ def plan_shards(
     *,
     n_jets: int | None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    skip_jets: int = 0,
 ) -> list[Shard]:
     """
     Class-balanced read plan.
@@ -282,7 +283,12 @@ def plan_shards(
     in order, so a given ``n_jets`` always selects the same jets and smaller
     budgets are nested inside larger ones. Shards are interleaved by class so
     that consecutive reads cycle through all ten labels.
+
+    ``skip_jets`` advances the same per-class file cursors before taking the
+    budget, so ``(skip=0, n)``, ``(skip=n, n)``, ``(skip=2n, n)`` are disjoint
+    equal-size shards (used for graph-construction seed×shard repeats).
     """
+    skip_jets = max(0, int(skip_jets))
     per_class_lists: list[list[Shard]] = []
     for label in range(N_CLASSES):
         files = class_files(data_root, split, label)
@@ -291,12 +297,19 @@ def plan_shards(
             if n_jets is None
             else _per_class_quota(n_jets, label)
         )
+        skip_budget = 0 if n_jets is None else _per_class_quota(skip_jets, label)
         shards: list[Shard] = []
         remaining = budget
+        to_skip = skip_budget
         for path in files:
             if remaining <= 0:
                 break
             start = 0
+            # Consume skip within this file first.
+            if to_skip > 0 and start < JETS_PER_FILE:
+                adv = min(JETS_PER_FILE - start, to_skip)
+                start += adv
+                to_skip -= adv
             while remaining > 0 and start < JETS_PER_FILE:
                 take = min(chunk_size, JETS_PER_FILE - start, remaining)
                 shards.append(Shard(path, label, start, start + take))
@@ -632,11 +645,18 @@ class JetClassStreamDataset(IterableDataset):
         self.shuffle_buffer = shuffle_buffer
         self.shuffle_seed = shuffle_seed
         self.sort_by_pt = sort_by_pt
-        self.skip_jets = max(0, int(skip_jets))
+        # Shard offset is baked into ``plan_shards`` (disjoint train windows).
+        # ``skip_jets`` is only the within-plan resume overlay (preempt/continue).
+        self.base_skip_jets = max(0, int(skip_jets))
+        self.skip_jets = 0
         self.ddp_rank = max(0, int(ddp_rank))
         self.ddp_world_size = max(1, int(ddp_world_size))
         self.shards = plan_shards(
-            data_root, split, n_jets=n_jets, chunk_size=chunk_size
+            data_root,
+            split,
+            n_jets=n_jets,
+            chunk_size=chunk_size,
+            skip_jets=self.base_skip_jets,
         )
         self.n_jets = sum(s.n_jets for s in self.shards)
 

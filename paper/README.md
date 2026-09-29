@@ -15,32 +15,25 @@ conda activate mamba-env
 cd coupled-particle-edge-networks
 python paper/data/collect_jetclass_paper_metrics.py
 python paper/style/plot_jetclass_paper.py
-# or iterate in notebooks/paper_jetclass_nature_figures.ipynb
 ```
 
 ## Current figures
 
-| Stem | Content |
-|------|---------|
-| `fig_jetclass_ablation_1m` | Graph construction: edges vs M11; kNN $k$; star radius $R_\star$ |
-| `fig_jetclass_graph_geometry` | Graph geometry vs $k$ / $R_\star$ + JetClass ROC plateau vs $R_\star$ |
-| `fig_jetclass_adam_transfer_45k` | Adam η₀ transfer @ 45k: train loss + val ROC (D/H labels) |
+| Stem | Status | Content |
+|------|--------|---------|
+| `fig_jetclass_adam_transfer_45k` | **active** | Adam η₀ transfer @ 45k: train loss + val ROC |
+| `fig_jetclass_ablation_1m` | archived | Old graph-construction 1×3 (mismatched B) |
+| `fig_jetclass_graph_geometry` | archived | Geometry + old ROC-vs-\(R_\star\) |
 
-Geometry CSVs (`graph_geometry_knn.csv`, `graph_geometry_star.csv`) come from the
-TopTagging scans in `notebooks/jets/knn_graph_study.ipynb` and
-`notebooks/jets/radius_hypergraph_study.ipynb` (\(k{=}6\) on the linear branch
-from \(k{=}1\)).
+Archived copies: `paper/archive/graph_construction_2026-09-28/`.
 
-## Known data gaps
+New graph-construction figures will be rebuilt from the matched A100-80GB
+recipe in `scans/jets/GRAPH_CONSTRUCTION_RECIPE.md` (Plot 1 = \(k\) sweep at
+\(R_\star{=}0.125\), B=384, 1000 steps, 3 shards × 2 inits). Superseded
+submitters live under `scans/jets/archive/` (gitignored).
 
-- **D=384 background rejection @ 45k** was not logged (`heavy_metrics` off). ROC/acc are present.
-- Ablation panel **b** uses a matched 2-epoch B=256 budget; panel **a** is 1 epoch @ B=512.
+## Geometry notebooks (still valid structurally)
 
-## Why D=384 has no background rejection at 45k
-
-`val_bg_rejection` (ε_sig=0.5) and `val_bg_rejection_0p3` (ε_sig=0.3) are computed
-together in the same heavy-metrics path. Mid-run `[val]` log lines intentionally omit
-both (see `ParquetLoggerCallback._VAL_PRINT_KEYS`). D=256 jobs that **ended** at 45k
-persisted rejection via the final parquet / end-of-run summary. D=384 jobs continued to
-100k with **no parquet logger output**, so rejection at 45k was never written—neither
-at 0.5 nor at 0.3. Fix: short offline re-eval from a ~45k ckpt (or re-run with parquet).
+TopTagging geometry CSVs can be rebuilt from
+`notebooks/jets/knn_graph_study.ipynb` and
+`notebooks/jets/radius_hypergraph_study.ipynb` (independent of training B).

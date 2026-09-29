@@ -300,6 +300,9 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
             tags.append("nostar")
         n_train = getattr(args, "n_train", None)
         tags.append("Dfull" if n_train is None else f"D{_format_count(int(n_train))}")
+        skip = int(getattr(args, "train_skip_jets", 0) or 0)
+        if skip > 0:
+            tags.append(f"skip{_format_count(skip)}")
         max_steps = getattr(args, "max_steps", None)
         if max_steps:
             tags.append(f"s{_format_count(int(max_steps))}")
@@ -491,6 +494,16 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
             "cache costs ~46.5 kB/jet, so 100M jets would need several TB per "
             "radius. Uses --star-radius as the live radius and expects "
             "--jetclass-raw-root (or --data-root) to be the raw ROOT tree."
+        ),
+    )
+    parser.add_argument(
+        "--train-skip-jets",
+        type=int,
+        default=0,
+        help=(
+            "With --jetclass-stream: advance the class-balanced train plan by "
+            "this many jets before taking --n-train. Use shard*n_train for "
+            "disjoint equal-size train shards."
         ),
     )
     parser.add_argument(
@@ -1089,6 +1102,7 @@ def create_jetclass_datamodule(args, *, data_root):  # type: ignore[no-untyped-d
             n_test=getattr(args, "n_test", None),
             shuffle_seed=int(getattr(args, "seed", 0) or 0),
             sort_by_pt=bool(getattr(args, "jetclass_sort_by_pt", False)),
+            train_skip_jets=int(getattr(args, "train_skip_jets", 0) or 0),
         )
     # Bytecode train_one_run reads dm.corr_adam / corr_sgd into LitCPEN.corr
     # *after* dm.setup(). Stream/cache DMs must not reset these in setup.

@@ -64,6 +64,7 @@ class JetClassStreamDatamodule(BaseDatamodule):
         shuffle_seed: int = 0,
         shuffle_buffer: int | None = None,
         sort_by_pt: bool = False,
+        train_skip_jets: int = 0,
     ) -> None:
         super().__init__(data_root, batch_size, num_workers=num_workers)
         self.num_particles = int(num_particles)
@@ -77,6 +78,7 @@ class JetClassStreamDatamodule(BaseDatamodule):
         # still shuffle via the map-style DataLoader.
         self.shuffle_buffer = 0 if shuffle_buffer is None else int(shuffle_buffer)
         self.sort_by_pt = bool(sort_by_pt)
+        self.train_skip_jets = max(0, int(train_skip_jets))
         self.n_particles = self.num_particles
         # Validate eagerly so a typo fails before any ROOT file is opened.
         feature_names(self.feature_config)
@@ -152,12 +154,14 @@ class JetClassStreamDatamodule(BaseDatamodule):
                 shuffle_seed=self.shuffle_seed,
                 shuffle_buffer=self.shuffle_buffer,
                 sort_by_pt=self.sort_by_pt,
+                skip_jets=self.train_skip_jets,
                 ddp_rank=rank,
                 ddp_world_size=world,
             )
             log_info(
                 f"[graphs] split=train mode=stream (single pass) "
-                f"n_jets={dataset.n_jets:,} features={self.feature_config} "
+                f"n_jets={dataset.n_jets:,} skip={self.train_skip_jets:,} "
+                f"features={self.feature_config} "
                 f"n_particles={self.num_particles} shuffle_buffer={self.shuffle_buffer}"
             )
             return dataset
