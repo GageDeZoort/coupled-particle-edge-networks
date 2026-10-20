@@ -1,0 +1,7 @@
+{"ts":"2026-10-14T11:22:03-04:00","event":"reserve","run_id":"giant-L8D1024-s40k-eta0p1","n_train_files":210,"files_per_class":21,"n_train_jets":21000000,"host":"ubuntu@168.110.21.94"}
+{"ts":"2026-10-14T12:25:16-04:00","event":"reserve","run_id":"giant-L8D1024-s40k-eta0p1","n_train_files":210,"files_per_class":21,"n_train_jets":21000000,"host":"ubuntu@168.110.21.94"}
+{"ts":"2026-10-14T12:36:28-04:00","event":"hard_reset","run_id":"giant-L8D1024-s40k-eta0p1","note":"wiped Lambda data+runs; restage train-only 210 files"}
+{"ts":"2026-10-14T12:36:32-04:00","event":"reserve","run_id":"giant-L8D1024-s40k-eta0p1","n_train_files":210,"files_per_class":21,"n_train_jets":21000000,"host":"ubuntu@168.110.21.94"}
+{"ts":"2026-10-14T12:49:09-04:00","event":"replan","run_id":"giant-L8D1024-full-eta0p1","note":"full epoch 100/class dh32 B512 eta0.1 train-only"}
+{"ts":"2026-10-14T12:49:10-04:00","event":"reserve","run_id":"giant-L8D1024-full-eta0p1","n_train_files":1000,"files_per_class":100,"n_train_jets":100000000,"host":"ubuntu@168.110.21.94"}
+{"ts":"2026-10-14T14:21:56-04:00","event":"reserve","run_id":"giant-L8D1024-s40k-eta0p1","n_train_files":210,"files_per_class":21,"n_train_jets":21000000,"parallel":8,"host":"ubuntu@168.110.21.94"}

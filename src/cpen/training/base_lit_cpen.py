@@ -134,6 +134,10 @@ class BaseLitCPEN(L.LightningModule):
         live_edge_features: str = "part-interaction",
         live_centroid_weight: str | None = None,
         live_no_star_hyperedges: bool = False,
+        live_knn_include_self: bool = False,
+        live_part_interaction_preprocess: tuple[tuple[float, float], ...] | None = None,
+        live_star_kin7: bool = True,
+        live_star_seed_min_pt: float = 0.0,
         warmup_steps: int = 0,
         flat_steps: int = 0,
         cosine_steps: int | None = None,
@@ -165,8 +169,13 @@ class BaseLitCPEN(L.LightningModule):
         self.live_edge_features = live_edge_features
         self.live_centroid_weight = live_centroid_weight
         self.live_no_star_hyperedges = bool(live_no_star_hyperedges)
-        # live_star_radius + live_graph_k together ⇒ star hyperedges ∥ kNN 2-edges.
+        self.live_knn_include_self = bool(live_knn_include_self)
+        self.live_part_interaction_preprocess = live_part_interaction_preprocess
+        self.live_star_kin7 = bool(live_star_kin7)
+        self.live_star_seed_min_pt = float(live_star_seed_min_pt)
+        # live_star_radius + live_graph_k ⇒ canonical star-R (kin7) ∥ ΔR-kNN.
         # live_no_star_hyperedges + live_graph_k ⇒ ΔR-kNN 2-edges only.
+        # live_knn_include_self=False (default) ⇒ true neighbors only (no self spike).
 
         self._build_task_metrics(int(model.out_dim))
 
@@ -286,19 +295,23 @@ class BaseLitCPEN(L.LightningModule):
                     mask=mask,
                     edge_features=self.live_edge_features,
                     radius=float(self.live_star_radius or 0.2),
+                    part_interaction_preprocess=self.live_part_interaction_preprocess,
+                    include_self=self.live_knn_include_self,
                 )
                 batch["edge_x"] = edge_x
                 batch["incidence"] = incidence
             elif self.live_star_radius is not None and self.live_graph_k is not None:
-                from cpen.graphs.graph_star import build_star_plus_knn_graph
+                # Canonical: star-R kin7 aggregates ∥ ΔR-kNN part-interaction.
+                from cpen.graphs.graph_star import build_star_kin7_plus_knn_graph
 
-                edge_x, incidence = build_star_plus_knn_graph(
+                edge_x, incidence = build_star_kin7_plus_knn_graph(
                     x_raw,
                     radius=float(self.live_star_radius),
                     k=int(self.live_graph_k),
                     mask=mask,
-                    edge_features=self.live_edge_features,
-                    centroid_weight=self.live_centroid_weight,
+                    seed_min_pt=float(self.live_star_seed_min_pt),
+                    part_interaction_preprocess=self.live_part_interaction_preprocess,
+                    include_self=self.live_knn_include_self,
                 )
                 batch["edge_x"] = edge_x
                 batch["incidence"] = incidence
@@ -311,6 +324,7 @@ class BaseLitCPEN(L.LightningModule):
                     mask=mask,
                     edge_features=self.live_edge_features,
                     centroid_weight=self.live_centroid_weight,
+                    part_interaction_preprocess=self.live_part_interaction_preprocess,
                 )
                 batch["edge_x"] = edge_x
                 batch["incidence"] = incidence
@@ -633,5 +647,9 @@ class BaseLitCPEN(L.LightningModule):
             meta["t_epoch"] = self.t_epoch
         if self.lambda_0 is not None:
             meta["lambda_0"] = self.lambda_0
+        if self.live_part_interaction_preprocess is not None:
+            meta["part_interaction_preprocess"] = [
+                [float(a), float(b)] for a, b in self.live_part_interaction_preprocess
+            ]
         meta.update(self.run_options)
         return meta

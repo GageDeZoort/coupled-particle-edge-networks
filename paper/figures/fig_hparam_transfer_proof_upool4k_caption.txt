@@ -1,0 +1,1 @@
+Figure. Uniform-pool Adam const-LR η₀×D at 4000 steps (same recipe as upool10k). Y-axis fixed to [0.938, 0.957] shared with the mature band so mid-η plateau noise is not exaggerated. Argmax η₀ in the mid-band is soft (span ≲ 0.003) until ~10k, where both widths lock onto η₀=0.1. Values from Lambda train logs (val every 500).

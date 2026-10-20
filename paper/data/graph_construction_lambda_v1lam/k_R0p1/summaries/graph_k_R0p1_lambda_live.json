@@ -1,0 +1,1341 @@
+{
+  "updated": "2026-10-03 11:36:03 ET",
+  "ensure": "alive",
+  "n_done": 54,
+  "n_run": 0,
+  "n_pd": 0,
+  "n_fail": 0,
+  "n_total": 54,
+  "runner": true,
+  "active": "runner alive",
+  "mean_by_k": [
+    {
+      "k": 1,
+      "n_done": 6,
+      "n_total": 6,
+      "mean": 0.9397088388601939,
+      "std": 0.0008700708053451893,
+      "rocs": [
+        0.9387103915214539,
+        0.9412215948104858,
+        0.9396167993545532,
+        0.9399445056915283,
+        0.939048707485199,
+        0.9397110342979431
+      ]
+    },
+    {
+      "k": 2,
+      "n_done": 6,
+      "n_total": 6,
+      "mean": 0.9376197556654612,
+      "std": 0.0026076480531081973,
+      "rocs": [
+        0.9408167004585266,
+        0.9363978505134583,
+        0.9386470317840576,
+        0.9338984489440918,
+        0.936091959476471,
+        0.9398665428161621
+      ]
+    },
+    {
+      "k": 3,
+      "n_done": 6,
+      "n_total": 6,
+      "mean": 0.9382276237010956,
+      "std": 0.0014974447519792216,
+      "rocs": [
+        0.9397853016853333,
+        0.9372813105583191,
+        0.9394710063934326,
+        0.9392099380493164,
+        0.9376320242881775,
+        0.9359861612319946
+      ]
+    },
+    {
+      "k": 4,
+      "n_done": 6,
+      "n_total": 6,
+      "mean": 0.9398731688658396,
+      "std": 0.001902530507289497,
+      "rocs": [
+        0.9401411414146423,
+        0.93980473279953,
+        0.9412983655929565,
+        0.9418300986289978,
+        0.9397774338722229,
+        0.9363872408866882
+      ]
+    },
+    {
+      "k": 5,
+      "n_done": 6,
+      "n_total": 6,
+      "mean": 0.9388522207736969,
+      "std": 0.003002950233823039,
+      "rocs": [
+        0.9415469765663147,
+        0.9415939450263977,
+        0.9385169148445129,
+        0.9363300800323486,
+        0.9407650828361511,
+        0.9343603253364563
+      ]
+    },
+    {
+      "k": 6,
+      "n_done": 6,
+      "n_total": 6,
+      "mean": 0.9397999942302704,
+      "std": 0.000958829915964804,
+      "rocs": [
+        0.941376805305481,
+        0.9404893517494202,
+        0.9397367238998413,
+        0.9391345381736755,
+        0.9390884041786194,
+        0.938974142074585
+      ]
+    },
+    {
+      "k": 7,
+      "n_done": 6,
+      "n_total": 6,
+      "mean": 0.9398399392763773,
+      "std": 0.0005525770637787987,
+      "rocs": [
+        0.9403891563415527,
+        0.9394277930259705,
+        0.9399822950363159,
+        0.940566897392273,
+        0.9393310546875,
+        0.9393424391746521
+      ]
+    },
+    {
+      "k": 8,
+      "n_done": 6,
+      "n_total": 6,
+      "mean": 0.9400159617265066,
+      "std": 0.0008406733774773652,
+      "rocs": [
+        0.9408367276191711,
+        0.9405122995376587,
+        0.9402676820755005,
+        0.9405625462532043,
+        0.9388744235038757,
+        0.9390420913696289
+      ]
+    },
+    {
+      "k": 10,
+      "n_done": 6,
+      "n_total": 6,
+      "mean": 0.9398272633552551,
+      "std": 0.0014610767492888967,
+      "rocs": [
+        0.9410997033119202,
+        0.9400821924209595,
+        0.9407591223716736,
+        0.9409747123718262,
+        0.9376362562179565,
+        0.9384115934371948
+      ]
+    }
+  ],
+  "edge_notes": [
+    {
+      "k": 1,
+      "gamma12_mean": 5.844733333333333,
+      "n_live_edges": 38712,
+      "pool": "attentional"
+    },
+    {
+      "k": 2,
+      "gamma12_mean": 4.563166666666667,
+      "n_live_edges": 58069,
+      "pool": "attentional"
+    },
+    {
+      "k": 3,
+      "gamma12_mean": 3.9224,
+      "n_live_edges": 77425,
+      "pool": "attentional"
+    },
+    {
+      "k": 4,
+      "gamma12_mean": 3.5379,
+      "n_live_edges": 96780,
+      "pool": "attentional"
+    },
+    {
+      "k": 5,
+      "gamma12_mean": 3.2816,
+      "n_live_edges": 116136,
+      "pool": "attentional"
+    },
+    {
+      "k": 6,
+      "gamma12_mean": 3.098533333333333,
+      "n_live_edges": 135491,
+      "pool": "attentional"
+    },
+    {
+      "k": 7,
+      "gamma12_mean": 2.9612333333333334,
+      "n_live_edges": 154844,
+      "pool": "attentional"
+    },
+    {
+      "k": 8,
+      "gamma12_mean": 2.8544666666666667,
+      "n_live_edges": 174193,
+      "pool": "attentional"
+    },
+    {
+      "k": 10,
+      "gamma12_mean": 2.6992333333333334,
+      "n_live_edges": 212871,
+      "pool": "attentional"
+    }
+  ],
+  "pool": "attentional (uniform_output_pool=False)",
+  "cells": [
+    {
+      "task": 0,
+      "k": 1,
+      "shard": 0,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9387103915214539,
+      "last_roc": 0.9387103915214539,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9387103915214539
+        }
+      ],
+      "log": "k1_shard0_seed0_R0p1.out",
+      "gamma12": 6.2183,
+      "n_live_edges": 35870,
+      "pool": "attentional"
+    },
+    {
+      "task": 1,
+      "k": 1,
+      "shard": 0,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9412215948104858,
+      "last_roc": 0.9412215948104858,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9412215948104858
+        }
+      ],
+      "log": "k1_shard0_seed1_R0p1.out",
+      "gamma12": 6.2183,
+      "n_live_edges": 35870,
+      "pool": "attentional"
+    },
+    {
+      "task": 2,
+      "k": 1,
+      "shard": 1,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9396167993545532,
+      "last_roc": 0.9396167993545532,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9396167993545532
+        }
+      ],
+      "log": "k1_shard1_seed0_R0p1.out",
+      "gamma12": 5.6358,
+      "n_live_edges": 40440,
+      "pool": "attentional"
+    },
+    {
+      "task": 3,
+      "k": 1,
+      "shard": 1,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9399445056915283,
+      "last_roc": 0.9399445056915283,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9399445056915283
+        }
+      ],
+      "log": "k1_shard1_seed1_R0p1.out",
+      "gamma12": 5.6358,
+      "n_live_edges": 40440,
+      "pool": "attentional"
+    },
+    {
+      "task": 4,
+      "k": 1,
+      "shard": 2,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.939048707485199,
+      "last_roc": 0.939048707485199,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.939048707485199
+        }
+      ],
+      "log": "k1_shard2_seed0_R0p1.out",
+      "gamma12": 5.6801,
+      "n_live_edges": 39828,
+      "pool": "attentional"
+    },
+    {
+      "task": 5,
+      "k": 1,
+      "shard": 2,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9397110342979431,
+      "last_roc": 0.9397110342979431,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9397110342979431
+        }
+      ],
+      "log": "k1_shard2_seed1_R0p1.out",
+      "gamma12": 5.6801,
+      "n_live_edges": 39828,
+      "pool": "attentional"
+    },
+    {
+      "task": 6,
+      "k": 2,
+      "shard": 0,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9408167004585266,
+      "last_roc": 0.9408167004585266,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9408167004585266
+        }
+      ],
+      "log": "k2_shard0_seed0_R0p1.out",
+      "gamma12": 4.8122,
+      "n_live_edges": 53805,
+      "pool": "attentional"
+    },
+    {
+      "task": 7,
+      "k": 2,
+      "shard": 0,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9363978505134583,
+      "last_roc": 0.9363978505134583,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9363978505134583
+        }
+      ],
+      "log": "k2_shard0_seed1_R0p1.out",
+      "gamma12": 4.8122,
+      "n_live_edges": 53805,
+      "pool": "attentional"
+    },
+    {
+      "task": 8,
+      "k": 2,
+      "shard": 1,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9386470317840576,
+      "last_roc": 0.9386470317840576,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9386470317840576
+        }
+      ],
+      "log": "k2_shard1_seed0_R0p1.out",
+      "gamma12": 4.4239,
+      "n_live_edges": 60660,
+      "pool": "attentional"
+    },
+    {
+      "task": 9,
+      "k": 2,
+      "shard": 1,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9338984489440918,
+      "last_roc": 0.9338984489440918,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9338984489440918
+        }
+      ],
+      "log": "k2_shard1_seed1_R0p1.out",
+      "gamma12": 4.4239,
+      "n_live_edges": 60660,
+      "pool": "attentional"
+    },
+    {
+      "task": 10,
+      "k": 2,
+      "shard": 2,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.936091959476471,
+      "last_roc": 0.936091959476471,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.936091959476471
+        }
+      ],
+      "log": "k2_shard2_seed0_R0p1.out",
+      "gamma12": 4.4534,
+      "n_live_edges": 59742,
+      "pool": "attentional"
+    },
+    {
+      "task": 11,
+      "k": 2,
+      "shard": 2,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9398665428161621,
+      "last_roc": 0.9398665428161621,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9398665428161621
+        }
+      ],
+      "log": "k2_shard2_seed1_R0p1.out",
+      "gamma12": 4.4534,
+      "n_live_edges": 59742,
+      "pool": "attentional"
+    },
+    {
+      "task": 12,
+      "k": 3,
+      "shard": 0,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9397853016853333,
+      "last_roc": 0.9397853016853333,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9397853016853333
+        }
+      ],
+      "log": "k3_shard0_seed0_R0p1.out",
+      "gamma12": 4.1092,
+      "n_live_edges": 71740,
+      "pool": "attentional"
+    },
+    {
+      "task": 13,
+      "k": 3,
+      "shard": 0,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9372813105583191,
+      "last_roc": 0.9372813105583191,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9372813105583191
+        }
+      ],
+      "log": "k3_shard0_seed1_R0p1.out",
+      "gamma12": 4.1092,
+      "n_live_edges": 71740,
+      "pool": "attentional"
+    },
+    {
+      "task": 14,
+      "k": 3,
+      "shard": 1,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9394710063934326,
+      "last_roc": 0.9394710063934326,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9394710063934326
+        }
+      ],
+      "log": "k3_shard1_seed0_R0p1.out",
+      "gamma12": 3.8179,
+      "n_live_edges": 80880,
+      "pool": "attentional"
+    },
+    {
+      "task": 15,
+      "k": 3,
+      "shard": 1,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9392099380493164,
+      "last_roc": 0.9392099380493164,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9392099380493164
+        }
+      ],
+      "log": "k3_shard1_seed1_R0p1.out",
+      "gamma12": 3.8179,
+      "n_live_edges": 80880,
+      "pool": "attentional"
+    },
+    {
+      "task": 16,
+      "k": 3,
+      "shard": 2,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9376320242881775,
+      "last_roc": 0.9376320242881775,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9376320242881775
+        }
+      ],
+      "log": "k3_shard2_seed0_R0p1.out",
+      "gamma12": 3.8401,
+      "n_live_edges": 79656,
+      "pool": "attentional"
+    },
+    {
+      "task": 17,
+      "k": 3,
+      "shard": 2,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9359861612319946,
+      "last_roc": 0.9359861612319946,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9359861612319946
+        }
+      ],
+      "log": "k3_shard2_seed1_R0p1.out",
+      "gamma12": 3.8401,
+      "n_live_edges": 79656,
+      "pool": "attentional"
+    },
+    {
+      "task": 18,
+      "k": 4,
+      "shard": 0,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9401411414146423,
+      "last_roc": 0.9401411414146423,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9401411414146423
+        }
+      ],
+      "log": "k4_shard0_seed0_R0p1.out",
+      "gamma12": 3.6874,
+      "n_live_edges": 89672,
+      "pool": "attentional"
+    },
+    {
+      "task": 19,
+      "k": 4,
+      "shard": 0,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.93980473279953,
+      "last_roc": 0.93980473279953,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.93980473279953
+        }
+      ],
+      "log": "k4_shard0_seed1_R0p1.out",
+      "gamma12": 3.6874,
+      "n_live_edges": 89672,
+      "pool": "attentional"
+    },
+    {
+      "task": 20,
+      "k": 4,
+      "shard": 1,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9412983655929565,
+      "last_roc": 0.9412983655929565,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9412983655929565
+        }
+      ],
+      "log": "k4_shard1_seed0_R0p1.out",
+      "gamma12": 3.4543,
+      "n_live_edges": 101100,
+      "pool": "attentional"
+    },
+    {
+      "task": 21,
+      "k": 4,
+      "shard": 1,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9418300986289978,
+      "last_roc": 0.9418300986289978,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9418300986289978
+        }
+      ],
+      "log": "k4_shard1_seed1_R0p1.out",
+      "gamma12": 3.4543,
+      "n_live_edges": 101100,
+      "pool": "attentional"
+    },
+    {
+      "task": 22,
+      "k": 4,
+      "shard": 2,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9397774338722229,
+      "last_roc": 0.9397774338722229,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9397774338722229
+        }
+      ],
+      "log": "k4_shard2_seed0_R0p1.out",
+      "gamma12": 3.472,
+      "n_live_edges": 99570,
+      "pool": "attentional"
+    },
+    {
+      "task": 23,
+      "k": 4,
+      "shard": 2,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9363872408866882,
+      "last_roc": 0.9363872408866882,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9363872408866882
+        }
+      ],
+      "log": "k4_shard2_seed1_R0p1.out",
+      "gamma12": 3.472,
+      "n_live_edges": 99570,
+      "pool": "attentional"
+    },
+    {
+      "task": 24,
+      "k": 5,
+      "shard": 0,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9415469765663147,
+      "last_roc": 0.9415469765663147,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9415469765663147
+        }
+      ],
+      "log": "k5_shard0_seed0_R0p1.out",
+      "gamma12": 3.4062,
+      "n_live_edges": 107604,
+      "pool": "attentional"
+    },
+    {
+      "task": 25,
+      "k": 5,
+      "shard": 0,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9415939450263977,
+      "last_roc": 0.9415939450263977,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9415939450263977
+        }
+      ],
+      "log": "k5_shard0_seed1_R0p1.out",
+      "gamma12": 3.4062,
+      "n_live_edges": 107604,
+      "pool": "attentional"
+    },
+    {
+      "task": 26,
+      "k": 5,
+      "shard": 1,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9385169148445129,
+      "last_roc": 0.9385169148445129,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9385169148445129
+        }
+      ],
+      "log": "k5_shard1_seed0_R0p1.out",
+      "gamma12": 3.2119,
+      "n_live_edges": 121320,
+      "pool": "attentional"
+    },
+    {
+      "task": 27,
+      "k": 5,
+      "shard": 1,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9363300800323486,
+      "last_roc": 0.9363300800323486,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9363300800323486
+        }
+      ],
+      "log": "k5_shard1_seed1_R0p1.out",
+      "gamma12": 3.2119,
+      "n_live_edges": 121320,
+      "pool": "attentional"
+    },
+    {
+      "task": 28,
+      "k": 5,
+      "shard": 2,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9407650828361511,
+      "last_roc": 0.9407650828361511,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9407650828361511
+        }
+      ],
+      "log": "k5_shard2_seed0_R0p1.out",
+      "gamma12": 3.2267,
+      "n_live_edges": 119484,
+      "pool": "attentional"
+    },
+    {
+      "task": 29,
+      "k": 5,
+      "shard": 2,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9343603253364563,
+      "last_roc": 0.9343603253364563,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9343603253364563
+        }
+      ],
+      "log": "k5_shard2_seed1_R0p1.out",
+      "gamma12": 3.2267,
+      "n_live_edges": 119484,
+      "pool": "attentional"
+    },
+    {
+      "task": 30,
+      "k": 6,
+      "shard": 0,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.941376805305481,
+      "last_roc": 0.941376805305481,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.941376805305481
+        }
+      ],
+      "log": "k6_shard0_seed0_R0p1.out",
+      "gamma12": 3.2053,
+      "n_live_edges": 125536,
+      "pool": "attentional"
+    },
+    {
+      "task": 31,
+      "k": 6,
+      "shard": 0,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9404893517494202,
+      "last_roc": 0.9404893517494202,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9404893517494202
+        }
+      ],
+      "log": "k6_shard0_seed1_R0p1.out",
+      "gamma12": 3.2053,
+      "n_live_edges": 125536,
+      "pool": "attentional"
+    },
+    {
+      "task": 32,
+      "k": 6,
+      "shard": 1,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9397367238998413,
+      "last_roc": 0.9397367238998413,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9397367238998413
+        }
+      ],
+      "log": "k6_shard1_seed0_R0p1.out",
+      "gamma12": 3.0388,
+      "n_live_edges": 141540,
+      "pool": "attentional"
+    },
+    {
+      "task": 33,
+      "k": 6,
+      "shard": 1,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9391345381736755,
+      "last_roc": 0.9391345381736755,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9391345381736755
+        }
+      ],
+      "log": "k6_shard1_seed1_R0p1.out",
+      "gamma12": 3.0388,
+      "n_live_edges": 141540,
+      "pool": "attentional"
+    },
+    {
+      "task": 34,
+      "k": 6,
+      "shard": 2,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9390884041786194,
+      "last_roc": 0.9390884041786194,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9390884041786194
+        }
+      ],
+      "log": "k6_shard2_seed0_R0p1.out",
+      "gamma12": 3.0515,
+      "n_live_edges": 139398,
+      "pool": "attentional"
+    },
+    {
+      "task": 35,
+      "k": 6,
+      "shard": 2,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.938974142074585,
+      "last_roc": 0.938974142074585,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.938974142074585
+        }
+      ],
+      "log": "k6_shard2_seed1_R0p1.out",
+      "gamma12": 3.0515,
+      "n_live_edges": 139398,
+      "pool": "attentional"
+    },
+    {
+      "task": 36,
+      "k": 7,
+      "shard": 0,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9403891563415527,
+      "last_roc": 0.9403891563415527,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9403891563415527
+        }
+      ],
+      "log": "k7_shard0_seed0_R0p1.out",
+      "gamma12": 3.0547,
+      "n_live_edges": 143462,
+      "pool": "attentional"
+    },
+    {
+      "task": 37,
+      "k": 7,
+      "shard": 0,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9394277930259705,
+      "last_roc": 0.9394277930259705,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9394277930259705
+        }
+      ],
+      "log": "k7_shard0_seed1_R0p1.out",
+      "gamma12": 3.0547,
+      "n_live_edges": 143462,
+      "pool": "attentional"
+    },
+    {
+      "task": 38,
+      "k": 7,
+      "shard": 1,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9399822950363159,
+      "last_roc": 0.9399822950363159,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9399822950363159
+        }
+      ],
+      "log": "k7_shard1_seed0_R0p1.out",
+      "gamma12": 2.909,
+      "n_live_edges": 161760,
+      "pool": "attentional"
+    },
+    {
+      "task": 39,
+      "k": 7,
+      "shard": 1,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.940566897392273,
+      "last_roc": 0.940566897392273,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.940566897392273
+        }
+      ],
+      "log": "k7_shard1_seed1_R0p1.out",
+      "gamma12": 2.909,
+      "n_live_edges": 161760,
+      "pool": "attentional"
+    },
+    {
+      "task": 40,
+      "k": 7,
+      "shard": 2,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9393310546875,
+      "last_roc": 0.9393310546875,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9393310546875
+        }
+      ],
+      "log": "k7_shard2_seed0_R0p1.out",
+      "gamma12": 2.92,
+      "n_live_edges": 159312,
+      "pool": "attentional"
+    },
+    {
+      "task": 41,
+      "k": 7,
+      "shard": 2,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9393424391746521,
+      "last_roc": 0.9393424391746521,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9393424391746521
+        }
+      ],
+      "log": "k7_shard2_seed1_R0p1.out",
+      "gamma12": 2.92,
+      "n_live_edges": 159312,
+      "pool": "attentional"
+    },
+    {
+      "task": 42,
+      "k": 8,
+      "shard": 0,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9408367276191711,
+      "last_roc": 0.9408367276191711,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9408367276191711
+        }
+      ],
+      "log": "k8_shard0_seed0_R0p1.out",
+      "gamma12": 2.9376,
+      "n_live_edges": 161381,
+      "pool": "attentional"
+    },
+    {
+      "task": 43,
+      "k": 8,
+      "shard": 0,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9405122995376587,
+      "last_roc": 0.9405122995376587,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9405122995376587
+        }
+      ],
+      "log": "k8_shard0_seed1_R0p1.out",
+      "gamma12": 2.9376,
+      "n_live_edges": 161381,
+      "pool": "attentional"
+    },
+    {
+      "task": 44,
+      "k": 8,
+      "shard": 1,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9402676820755005,
+      "last_roc": 0.9402676820755005,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9402676820755005
+        }
+      ],
+      "log": "k8_shard1_seed0_R0p1.out",
+      "gamma12": 2.808,
+      "n_live_edges": 181980,
+      "pool": "attentional"
+    },
+    {
+      "task": 45,
+      "k": 8,
+      "shard": 1,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9405625462532043,
+      "last_roc": 0.9405625462532043,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9405625462532043
+        }
+      ],
+      "log": "k8_shard1_seed1_R0p1.out",
+      "gamma12": 2.808,
+      "n_live_edges": 181980,
+      "pool": "attentional"
+    },
+    {
+      "task": 46,
+      "k": 8,
+      "shard": 2,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9388744235038757,
+      "last_roc": 0.9388744235038757,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9388744235038757
+        }
+      ],
+      "log": "k8_shard2_seed0_R0p1.out",
+      "gamma12": 2.8178,
+      "n_live_edges": 179219,
+      "pool": "attentional"
+    },
+    {
+      "task": 47,
+      "k": 8,
+      "shard": 2,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9390420913696289,
+      "last_roc": 0.9390420913696289,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9390420913696289
+        }
+      ],
+      "log": "k8_shard2_seed1_R0p1.out",
+      "gamma12": 2.8178,
+      "n_live_edges": 179219,
+      "pool": "attentional"
+    },
+    {
+      "task": 48,
+      "k": 10,
+      "shard": 0,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9410997033119202,
+      "last_roc": 0.9410997033119202,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9410997033119202
+        }
+      ],
+      "log": "k10_shard0_seed0_R0p1.out",
+      "gamma12": 2.7674,
+      "n_live_edges": 197169,
+      "pool": "attentional"
+    },
+    {
+      "task": 49,
+      "k": 10,
+      "shard": 0,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9400821924209595,
+      "last_roc": 0.9400821924209595,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9400821924209595
+        }
+      ],
+      "log": "k10_shard0_seed1_R0p1.out",
+      "gamma12": 2.7674,
+      "n_live_edges": 197169,
+      "pool": "attentional"
+    },
+    {
+      "task": 50,
+      "k": 10,
+      "shard": 1,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9407591223716736,
+      "last_roc": 0.9407591223716736,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9407591223716736
+        }
+      ],
+      "log": "k10_shard1_seed0_R0p1.out",
+      "gamma12": 2.6611,
+      "n_live_edges": 222411,
+      "pool": "attentional"
+    },
+    {
+      "task": 51,
+      "k": 10,
+      "shard": 1,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9409747123718262,
+      "last_roc": 0.9409747123718262,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9409747123718262
+        }
+      ],
+      "log": "k10_shard1_seed1_R0p1.out",
+      "gamma12": 2.6611,
+      "n_live_edges": 222411,
+      "pool": "attentional"
+    },
+    {
+      "task": 52,
+      "k": 10,
+      "shard": 2,
+      "seed": 0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9376362562179565,
+      "last_roc": 0.9376362562179565,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9376362562179565
+        }
+      ],
+      "log": "k10_shard2_seed0_R0p1.out",
+      "gamma12": 2.6692,
+      "n_live_edges": 219033,
+      "pool": "attentional"
+    },
+    {
+      "task": 53,
+      "k": 10,
+      "shard": 2,
+      "seed": 1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.9384115934371948,
+      "last_roc": 0.9384115934371948,
+      "pts": [
+        {
+          "S": 1000,
+          "roc": 0.9384115934371948
+        }
+      ],
+      "log": "k10_shard2_seed1_R0p1.out",
+      "gamma12": 2.6692,
+      "n_live_edges": 219033,
+      "pool": "attentional"
+    }
+  ]
+}

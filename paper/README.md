@@ -21,16 +21,18 @@ python paper/style/plot_jetclass_paper.py
 
 | Stem | Status | Content |
 |------|--------|---------|
+| `fig_stability_attn` / `_uniform` | **active** | One-step Adam μP ρ/Δρ (pool-tagged) |
 | `fig_jetclass_adam_transfer_45k` | **active** | Adam η₀ transfer @ 45k: train loss + val ROC |
 | `fig_jetclass_ablation_1m` | archived | Old graph-construction 1×3 (mismatched B) |
 | `fig_jetclass_graph_geometry` | archived | Geometry + old ROC-vs-\(R_\star\) |
 
 Archived copies: `paper/archive/graph_construction_2026-09-28/`.
 
-New graph-construction figures will be rebuilt from the matched A100-80GB
-recipe in `scans/jets/GRAPH_CONSTRUCTION_RECIPE.md` (Plot 1 = \(k\) sweep at
-\(R_\star{=}0.125\), B=384, 1000 steps, 3 shards × 2 inits). Superseded
-submitters live under `scans/jets/archive/` (gitignored).
+New graph-construction figures: `scans/jets/plot_graph_construction_nature.py`
+(recipe in `scans/jets/GRAPH_CONSTRUCTION_RECIPE.md` and
+`paper/figures/fig_graph_construction.md`). Active launchers are listed in
+`scans/jets/README.md`. Superseded scan scripts live under
+`scans/jets/archive/` (on-disk reference; mostly gitignored).
 
 ## Geometry notebooks (still valid structurally)
 

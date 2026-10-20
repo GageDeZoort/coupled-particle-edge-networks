@@ -4,9 +4,11 @@ Extends :class:`~cpen.models.capen_llama.CAPENLlama` without changing the defaul
 CAPEN-Llama behaviour.
 
 * **Readout** — :class:`~cpen.models.output_attention_pool.OutputAttentionPool`:
-  class tokens pool \(X^{(L)}\) and \(E^{(L)}\) independently (full-width
-  \(\alpha_A=1\) attention), fuse \(\frac{1}{\sqrt{2}}(P_1+P_2)\), then
-  per-class unembed \(z_a=\frac{1}{D\sigma_U}P_a\cdot w_a\).
+  class-token \(\alpha_A=1\) pools build Θ(1) features \(X_{\mathrm{out}}\)
+  (fuse \(\frac{1}{\sqrt{2}}(P_X+P_E)\)), then the CompleteP head
+  \(\mathrm{logit}_a=\frac{1}{D\sigma}X_{\mathrm{out},a}\cdot w_a\) with
+  \(w_a\sim\mathcal N(0,\sigma^2)\). Output \(\Delta\rho\) must stay \(O(1)\)
+  in width under Adam \(\eta=\eta_0/\sqrt{D}\).
 * **M₂₂** — edge–edge attention runs only among hyperedges (incidence degree
   ``> 2``). Pairwise kNN / vn_link slots keep identity ``f_22``. Implemented as
   gather→attend→scatter so we never materialize dense ``M×M`` attention scores
@@ -16,9 +18,9 @@ CAPEN-Llama behaviour.
 * **RoPE** — ``--use-rope`` applies axial :math:`(\\eta,\\phi)` rotary embeddings
   on relation 11 only (jet-centered :math:`(\\Delta\\eta,\\Delta\\phi)` from
   four-vectors). Mutually exclusive with ``--use-wire``.
-* **BaselineTransformer** — same Llama MLPs, CompleteP scales, and node
-  class-token pool, but ``m11_only``: no 12/21/22, no edge residual, no
-  \(\frac{1}{\sqrt{2}}\) fuse.
+* **BaselineTransformer** — separate particle-only class (not ``m11_only`` on
+  this trunk): Llama MLPs, CompleteP scales, node class-token pool, single-branch
+  residual \(\alpha_A^{\mathrm{res}}=1/L\) (no \(\sqrt{2}\)).
 """
 
 from __future__ import annotations
@@ -62,9 +64,12 @@ class CAPENLlamaAtt(CAPENLlama):
             self.output_pool = OutputAttentionPool(
                 int(self.D),
                 self.n_class_tokens,
+                heads=int(self.heads),
                 dropout=float(getattr(self, "dropout", 0.0) or 0.0),
                 node_only=self.m11_only,
             )
+        # Keep bytecode CAPEN CompleteP readout scale: 1/(D σ) = 1/√D.
+        # (Do not override to 1.0 — that breaks O(1) output-update μP.)
         self._pending_edge_type: torch.Tensor | None = None
         self._pending_edge_mask: torch.Tensor | None = None
         self._pending_is_hyper: torch.Tensor | None = None
@@ -182,7 +187,9 @@ class CAPENLlamaAtt(CAPENLlama):
             probe=probe,
         )
 
+        # Autocast may return bf16 while ``target`` (and thus ``out``) stays fp32.
         out = target.clone()
+        out_h = out_h.to(dtype=out.dtype)
         for b in range(batch):
             n = int(counts[b].item())
             if n > 0:
@@ -482,11 +489,19 @@ class CAPENLlamaAtt(CAPENLlama):
 
 
 class BaselineTransformer(CAPENLlamaAtt):
-    """Edgeless particle transformer: M11 + Llama MLPs + node class-token pool."""
+    """Edgeless particle transformer: M11 + Llama MLPs + node class-token pool.
+
+    Residual attention scale is \(1/L\) (one branch into the particle stream).
+    The coupled CAPEN trunk keeps \(1/(\\sqrt{2}\,L)\) because two attn branches
+    feed each stream — that \(\sqrt{2}\) must not leak onto this baseline.
+    """
 
     def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         kwargs["m11_only"] = True
         super().__init__(*args, **kwargs)
+        depth = max(int(self.depth), 1)
+        self._attn_residual_scale = 1.0 / float(depth)
+        self._mlp_residual_scale = 1.0 / float(depth)
 
 
 __all__ = ["CAPENLlamaAtt", "BaselineTransformer"]

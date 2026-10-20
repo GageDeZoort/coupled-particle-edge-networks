@@ -138,13 +138,40 @@ def test_ddp_replicas_partition_the_stream_without_overlap():
         for right in all_ids[i + 1 :]:
             assert left.isdisjoint(right)
 
-    # Equalizing to the shortest replica may drop a few remainder jets, but
-    # most of the plan must still be covered exactly once.
+    # Floor-quota segments may drop a few remainder jets, but most of the plan
+    # must still be covered exactly once.
     covered = set().union(*all_ids)
     full = _jet_ids(shards)
     assert covered <= full
     assert len(covered) >= int(0.95 * len(full))
     assert len(covered) == counts[0] * world * workers
+
+
+def test_ddp_replicas_equal_even_when_shard_sizes_are_uneven():
+    """File-aligned chunks after a large skip must not shrink the epoch."""
+    # Mimic skip=768k plans: same n_jets, uneven shard lengths across classes.
+    shards: list[Shard] = []
+    for label in range(N_CLASSES):
+        sizes = (500, 1500, 2000) if label % 2 == 0 else (1000, 1000, 2000)
+        start = 0
+        for n in sizes:
+            shards.append(Shard(Path(f"{label}.root"), label, start, start + n))
+            start += n
+    total = sum(s.n_jets for s in shards)
+    assert total == 4000 * N_CLASSES
+    world, workers = 2, 4
+    n_replicas = world * workers
+    plans = [
+        split_plan_over_replicas(
+            shards, rank=rank, world_size=world, worker_id=wid, num_workers=workers
+        )
+        for rank in range(world)
+        for wid in range(workers)
+    ]
+    counts = [sum(s.n_jets for s in plan) for plan in plans]
+    assert counts == [total // n_replicas] * n_replicas
+    covered = set().union(*(_jet_ids(p) for p in plans))
+    assert len(covered) == counts[0] * n_replicas
 
 
 def test_datamodule_ddp_identity_reads_trainer_world_size():

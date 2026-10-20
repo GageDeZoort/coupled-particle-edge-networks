@@ -1,0 +1,14 @@
+width,eta0,step,val_roc_auc,done,pool
+384,0.01,8000,0.944201,True,uniform
+384,0.05,8000,0.952172,True,uniform
+384,0.1,8000,0.953842,True,uniform
+384,0.25,8000,0.953858,True,uniform
+384,0.5,8000,0.95194,True,uniform
+384,1.0,8000,0.944901,True,uniform
+512,0.01,8000,0.944335,True,uniform
+512,0.05,8000,0.952288,True,uniform
+512,0.1,8000,0.953976,True,uniform
+512,0.18,8000,0.953982,True,uniform
+512,0.25,8000,0.954088,True,uniform
+512,0.5,8000,0.954776,True,uniform
+512,1.0,8000,0.943017,True,uniform

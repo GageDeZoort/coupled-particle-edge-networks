@@ -1,0 +1,9 @@
+k,n_edges_mean,n_edges_std,n_shards,n_jets_per_shard,source
+2,78.48997656249999,30.011251248959216,3,384000,plot1_train_shards_deltaR_knn_mask_jetstd
+4,156.97988281250002,60.022677348330106,3,384000,plot1_train_shards_deltaR_knn_mask_jetstd
+6,235.46892881944447,90.03613244725273,3,384000,plot1_train_shards_deltaR_knn_mask_jetstd
+8,313.95259895833334,120.0616264127667,3,384000,plot1_train_shards_deltaR_knn_mask_jetstd
+10,392.4140451388889,150.13425726141037,3,384000,plot1_train_shards_deltaR_knn_mask_jetstd
+12,470.8024036458333,180.35341483057712,3,384000,plot1_train_shards_deltaR_knn_mask_jetstd
+14,549.0150868055556,210.90396039897567,3,384000,plot1_train_shards_deltaR_knn_mask_jetstd
+16,626.8692994791667,242.0860950359187,3,384000,plot1_train_shards_deltaR_knn_mask_jetstd

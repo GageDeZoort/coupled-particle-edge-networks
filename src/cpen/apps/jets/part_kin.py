@@ -121,6 +121,51 @@ def _standardize(name: str, values: torch.Tensor) -> torch.Tensor:
     return (values - subtract) * multiply
 
 
+def _part_kin_features_vs_jet(
+    x: torch.Tensor,
+    jet: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    """Raw→affine kin7 for ``x`` ``(B,M,4)`` against jet 4-vectors ``(B,4)``."""
+    energy, px, py, pz = x.unbind(-1)
+    pt = torch.hypot(px, py)
+    e_j, px_j, py_j, pz_j = jet.unbind(-1)
+    pt_j = torch.hypot(px_j, py_j)
+    energy_j = e_j
+    eta_j = _pseudorapidity(px_j, py_j, pz_j, eps=eps)
+    phi_j = torch.atan2(py_j, px_j)
+
+    eta = _pseudorapidity(px, py, pz, eps=eps)
+    phi = torch.atan2(py, px)
+
+    eta_sign = torch.sign(eta_j)
+    eta_sign = torch.where(eta_sign == 0, torch.ones_like(eta_sign), eta_sign)
+    part_deta = (eta - eta_j.unsqueeze(-1)) * eta_sign.unsqueeze(-1)
+
+    raw_dphi = phi - phi_j.unsqueeze(-1)
+    part_dphi = torch.atan2(torch.sin(raw_dphi), torch.cos(raw_dphi))
+
+    part_pt_log = torch.log(pt.clamp_min(eps))
+    part_e_log = torch.log(energy.clamp_min(eps))
+    part_logptrel = torch.log((pt / pt_j.unsqueeze(-1).clamp_min(eps)).clamp_min(eps))
+    part_logerel = torch.log((energy / energy_j.unsqueeze(-1).clamp_min(eps)).clamp_min(eps))
+    part_deltaR = torch.hypot(part_deta, part_dphi)
+
+    raw_by_name = {
+        "part_pt_log": part_pt_log,
+        "part_e_log": part_e_log,
+        "part_logptrel": part_logptrel,
+        "part_logerel": part_logerel,
+        "part_deltaR": part_deltaR,
+        "part_deta": part_deta,
+        "part_dphi": part_dphi,
+    }
+    feats = [_standardize(name, raw_by_name[name]) for name in PART_KIN_FEATURE_NAMES]
+    return torch.stack(feats, dim=-1) * valid.unsqueeze(-1)
+
+
 def build_part_kin_features(
     constituents: torch.Tensor,
     mask: torch.Tensor | None = None,
@@ -161,41 +206,58 @@ def build_part_kin_features(
         bad = torch.nonzero(n_valid == 0).flatten().tolist()
         raise ValueError(f"Jets with no valid constituents at batch indices {bad}")
 
-    summed = (x * valid.unsqueeze(-1)).sum(dim=-2)
-    e_j, px_j, py_j, pz_j = summed.unbind(-1)
-    pt_j = torch.hypot(px_j, py_j)
-    energy_j = e_j
-    eta_j = _pseudorapidity(px_j, py_j, pz_j, eps=eps)
-    phi_j = torch.atan2(py_j, px_j)
+    jet = (x * valid.unsqueeze(-1)).sum(dim=-2)
+    features = _part_kin_features_vs_jet(x, jet, valid, eps=eps)
+    if l2_normalize:
+        features = scale_features_l2_sqrt_dim(features, eps=eps, mask=mask)
+    features = features.to(input_dtype)
+    if single:
+        features = features.squeeze(0)
+    return features
 
-    eta = _pseudorapidity(px, py, pz, eps=eps)
-    phi = torch.atan2(py, px)
 
-    eta_sign = torch.sign(eta_j)
-    eta_sign = torch.where(eta_sign == 0, torch.ones_like(eta_sign), eta_sign)
-    part_deta = (eta - eta_j.unsqueeze(-1)) * eta_sign.unsqueeze(-1)
+def build_part_kin_features_against_jet(
+    vectors: torch.Tensor,
+    jet: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    eps: float = 1e-12,
+    l2_normalize: bool = False,
+) -> torch.Tensor:
+    """
+    ParT-kin features for arbitrary 4-vectors against an external jet axis.
 
-    raw_dphi = phi - phi_j.unsqueeze(-1)
-    part_dphi = torch.atan2(torch.sin(raw_dphi), torch.cos(raw_dphi))
+    Used for DBSCAN cluster aggregates treated as pseudo-particles: relatives
+    (``ptrel``, ``deta``, …) are w.r.t. the *full jet* 4-sum, not the cluster.
+    ``vectors`` is ``(B, M, 4)`` or ``(M, 4)``; ``jet`` is ``(B, 4)`` or ``(4,)``.
+    """
+    single = vectors.dim() == 2
+    if single:
+        vectors = vectors.unsqueeze(0)
+        if mask is not None and mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        if jet.dim() == 1:
+            jet = jet.unsqueeze(0)
+    if vectors.dim() != 3 or vectors.size(-1) != 4:
+        raise ValueError(
+            f"vectors must be (batch, m, 4); got {tuple(vectors.shape)}"
+        )
+    if jet.dim() != 2 or jet.size(-1) != 4:
+        raise ValueError(f"jet must be (batch, 4); got {tuple(jet.shape)}")
+    if jet.size(0) != vectors.size(0):
+        raise ValueError(
+            f"jet batch {jet.size(0)} != vectors batch {vectors.size(0)}"
+        )
 
-    # Avoid log(0) on pads; values are zeroed by the mask below.
-    part_pt_log = torch.log(pt.clamp_min(eps))
-    part_e_log = torch.log(energy.clamp_min(eps))
-    part_logptrel = torch.log((pt / pt_j.unsqueeze(-1).clamp_min(eps)).clamp_min(eps))
-    part_logerel = torch.log((energy / energy_j.unsqueeze(-1).clamp_min(eps)).clamp_min(eps))
-    part_deltaR = torch.hypot(part_deta, part_dphi)
-
-    raw_by_name = {
-        "part_pt_log": part_pt_log,
-        "part_e_log": part_e_log,
-        "part_logptrel": part_logptrel,
-        "part_logerel": part_logerel,
-        "part_deltaR": part_deltaR,
-        "part_deta": part_deta,
-        "part_dphi": part_dphi,
-    }
-    feats = [_standardize(name, raw_by_name[name]) for name in PART_KIN_FEATURE_NAMES]
-    features = torch.stack(feats, dim=-1) * valid.unsqueeze(-1)
+    input_dtype = vectors.dtype
+    x = vectors.to(torch.float64)
+    jet64 = jet.to(torch.float64)
+    pt = torch.hypot(x[..., 1], x[..., 2])
+    if mask is None:
+        mask = pt > eps
+    mask = mask.to(torch.bool)
+    valid = mask.to(torch.float64)
+    features = _part_kin_features_vs_jet(x, jet64, valid, eps=eps)
     if l2_normalize:
         features = scale_features_l2_sqrt_dim(features, eps=eps, mask=mask)
     features = features.to(input_dtype)

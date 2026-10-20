@@ -1,0 +1,6 @@
+star_r,mean_support,support_std,n_shards,n_jets_per_shard,source
+0.05,5.230898847473992,1.983573130497487,3,384000,plot1_train_shards_star_support_jetstd
+0.1,9.732211187786525,3.558731473634531,3,384000,plot1_train_shards_star_support_jetstd
+0.15,13.371559705734253,4.974882741278871,3,384000,plot1_train_shards_star_support_jetstd
+0.2,16.540322261810303,6.393235265185224,3,384000,plot1_train_shards_star_support_jetstd
+0.25,19.49850961388482,7.801314284506958,3,384000,plot1_train_shards_star_support_jetstd

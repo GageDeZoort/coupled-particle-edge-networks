@@ -1,0 +1,6 @@
+Figure. Learning-rate transfer under uniform output pooling on JetClass.
+Holdout validation ROC–AUC after 10 000 Adam steps at constant peak LR
+η = η₀/√D versus base learning rate η₀, for widths D ∈ {384, 512}
+(L=4, d_h=32, B_eff=512, k★=6, R★=0.1, single-pass n_train=5.12M).
+D=384 peak η₀=0.1 (ROC=0.95560); D=512 peak η₀=0.1 (ROC=0.95589).
+Both widths peak at the same η₀, demonstrating μP LR transfer.

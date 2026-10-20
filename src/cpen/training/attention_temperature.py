@@ -47,6 +47,9 @@ def materialize_batch_incidence(
     live_centroid_weight: str | None = None,
     live_dense_pairs: bool = False,
     live_no_star_hyperedges: bool = False,
+    live_knn_include_self: bool = False,
+    live_star_kin7: bool = True,
+    live_star_seed_min_pt: float = 0.0,
     m11_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Ensure ``incidence`` + node mask exist (live star/kNN or dense-from-COO)."""
@@ -76,20 +79,21 @@ def materialize_batch_incidence(
                 mask=mask,
                 edge_features=live_edge_features,
                 radius=float(live_star_radius or 0.2),
+                include_self=live_knn_include_self,
             )
             out["edge_x"] = edge_x
             out["incidence"] = incidence
             out["mask"] = mask.bool()
         elif live_star_radius is not None and live_graph_k is not None:
-            from cpen.graphs.graph_star import build_star_plus_knn_graph
+            from cpen.graphs.graph_star import build_star_kin7_plus_knn_graph
 
-            edge_x, incidence = build_star_plus_knn_graph(
+            edge_x, incidence = build_star_kin7_plus_knn_graph(
                 x_raw,
                 radius=float(live_star_radius),
                 k=int(live_graph_k),
                 mask=mask,
-                edge_features=live_edge_features,
-                centroid_weight=live_centroid_weight,
+                seed_min_pt=float(live_star_seed_min_pt),
+                include_self=live_knn_include_self,
             )
             out["edge_x"] = edge_x
             out["incidence"] = incidence
@@ -163,6 +167,9 @@ def estimate_attention_gammas_from_batches(
     live_edge_features: str = "logdot-dp",
     live_centroid_weight: str | None = None,
     live_no_star_hyperedges: bool = False,
+    live_knn_include_self: bool = False,
+    live_star_kin7: bool = True,
+    live_star_seed_min_pt: float = 0.0,
     m11_only: bool = False,
 ) -> tuple[Any, dict[str, dict[str, Any]]]:
     """Mean nonempty support row degrees from the first train batches."""
@@ -180,6 +187,9 @@ def estimate_attention_gammas_from_batches(
             live_edge_features=live_edge_features,
             live_centroid_weight=live_centroid_weight,
             live_no_star_hyperedges=live_no_star_hyperedges,
+            live_knn_include_self=live_knn_include_self,
+                                                live_star_kin7=live_star_kin7,
+                                    live_star_seed_min_pt=live_star_seed_min_pt,
             m11_only=m11_only,
         )
         if "incidence" not in batch:
@@ -257,6 +267,9 @@ def estimate_attention_gammas_from_datamodule(
     live_edge_features: str = "logdot-dp",
     live_centroid_weight: str | None = None,
     live_no_star_hyperedges: bool = False,
+    live_knn_include_self: bool = False,
+    live_star_kin7: bool = True,
+    live_star_seed_min_pt: float = 0.0,
     m11_only: bool = False,
 ) -> tuple[Any, dict[str, dict[str, Any]]]:
     """Pull the first train batches from ``datamodule`` and estimate γ."""
@@ -292,6 +305,9 @@ def estimate_attention_gammas_from_datamodule(
         live_edge_features=live_edge_features,
         live_centroid_weight=live_centroid_weight,
         live_no_star_hyperedges=live_no_star_hyperedges,
+        live_knn_include_self=live_knn_include_self,
+                                live_star_kin7=live_star_kin7,
+                        live_star_seed_min_pt=live_star_seed_min_pt,
         m11_only=m11_only,
     )
 

@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
         data_root=DEFAULT_DATA_ROOT,
         toptagging_live=True,
         jetclass_edge_features="part-interaction",
-        star_radius=0.2,
+        star_radius=0.1,
         live_knn_k=6,
         num_particles=80,
         checkpoint_monitor="val_roc_auc",

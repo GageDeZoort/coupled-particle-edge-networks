@@ -1,0 +1,707 @@
+{
+  "updated": "2026-10-02 16:08:52 ET",
+  "uniform": [
+    {
+      "task": 0,
+      "width": 256,
+      "eta0": 0.05,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.930705,
+      "last_roc": 0.930705,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.89969
+        },
+        {
+          "S": 400,
+          "roc": 0.922768
+        },
+        {
+          "S": 600,
+          "roc": 0.929786
+        },
+        {
+          "S": 800,
+          "roc": 0.930586
+        },
+        {
+          "S": 1000,
+          "roc": 0.930705
+        }
+      ],
+      "log": "jc_upool_xfer_14882958_0.out",
+      "partition": "gputest",
+      "pool": "uniform"
+    },
+    {
+      "task": 1,
+      "width": 256,
+      "eta0": 0.1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.933043,
+      "last_roc": 0.932773,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.909251
+        },
+        {
+          "S": 400,
+          "roc": 0.926125
+        },
+        {
+          "S": 600,
+          "roc": 0.929471
+        },
+        {
+          "S": 800,
+          "roc": 0.933043
+        },
+        {
+          "S": 1000,
+          "roc": 0.932773
+        }
+      ],
+      "log": "jc_upool_xfer_14882958_1.out",
+      "partition": "gputest",
+      "pool": "uniform"
+    },
+    {
+      "task": 2,
+      "width": 256,
+      "eta0": 0.25,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.935708,
+      "last_roc": 0.935708,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.914503
+        },
+        {
+          "S": 400,
+          "roc": 0.929601
+        },
+        {
+          "S": 600,
+          "roc": 0.929835
+        },
+        {
+          "S": 800,
+          "roc": 0.933804
+        },
+        {
+          "S": 1000,
+          "roc": 0.935708
+        }
+      ],
+      "log": "jc_upool_xfer_14882958_2.out",
+      "partition": "gputest",
+      "pool": "uniform"
+    },
+    {
+      "task": 3,
+      "width": 256,
+      "eta0": 0.5,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.935144,
+      "last_roc": 0.935144,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.919256
+        },
+        {
+          "S": 400,
+          "roc": 0.927505
+        },
+        {
+          "S": 600,
+          "roc": 0.928613
+        },
+        {
+          "S": 800,
+          "roc": 0.935048
+        },
+        {
+          "S": 1000,
+          "roc": 0.935144
+        }
+      ],
+      "log": "jc_upool_xfer_14882958_3.out",
+      "partition": "gputest",
+      "pool": "uniform"
+    },
+    {
+      "task": 4,
+      "width": 256,
+      "eta0": 1.0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.933453,
+      "last_roc": 0.933453,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.914615
+        },
+        {
+          "S": 400,
+          "roc": 0.926174
+        },
+        {
+          "S": 600,
+          "roc": 0.929675
+        },
+        {
+          "S": 800,
+          "roc": 0.932211
+        },
+        {
+          "S": 1000,
+          "roc": 0.933453
+        }
+      ],
+      "log": "jc_upool_xfer_14882958_4.out",
+      "partition": "gputest",
+      "pool": "uniform"
+    },
+    {
+      "task": 5,
+      "width": 512,
+      "eta0": 0.05,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.93075,
+      "last_roc": 0.930719,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.898274
+        },
+        {
+          "S": 400,
+          "roc": 0.921711
+        },
+        {
+          "S": 600,
+          "roc": 0.929551
+        },
+        {
+          "S": 800,
+          "roc": 0.93075
+        },
+        {
+          "S": 1000,
+          "roc": 0.930719
+        }
+      ],
+      "log": "jc_upool_xfer_14890706_5.out",
+      "partition": "gputest",
+      "pool": "uniform"
+    },
+    {
+      "task": 6,
+      "width": 512,
+      "eta0": 0.1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.933063,
+      "last_roc": 0.932475,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.908812
+        },
+        {
+          "S": 400,
+          "roc": 0.926405
+        },
+        {
+          "S": 600,
+          "roc": 0.929244
+        },
+        {
+          "S": 800,
+          "roc": 0.933063
+        },
+        {
+          "S": 1000,
+          "roc": 0.932475
+        }
+      ],
+      "log": "jc_upool_xfer_14890706_6.out",
+      "partition": "gputest",
+      "pool": "uniform"
+    },
+    {
+      "task": 7,
+      "width": 512,
+      "eta0": 0.25,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.935644,
+      "last_roc": 0.935644,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.913006
+        },
+        {
+          "S": 400,
+          "roc": 0.928591
+        },
+        {
+          "S": 600,
+          "roc": 0.930878
+        },
+        {
+          "S": 800,
+          "roc": 0.934415
+        },
+        {
+          "S": 1000,
+          "roc": 0.935644
+        }
+      ],
+      "log": "jc_upool_xfer_14890706_7.out",
+      "partition": "gputest",
+      "pool": "uniform"
+    },
+    {
+      "task": 8,
+      "width": 512,
+      "eta0": 0.5,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.935959,
+      "last_roc": 0.935959,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.918991
+        },
+        {
+          "S": 400,
+          "roc": 0.928087
+        },
+        {
+          "S": 600,
+          "roc": 0.930453
+        },
+        {
+          "S": 800,
+          "roc": 0.934023
+        },
+        {
+          "S": 1000,
+          "roc": 0.935959
+        }
+      ],
+      "log": "jc_upool_xfer_14890706_8.out",
+      "partition": "gputest",
+      "pool": "uniform"
+    },
+    {
+      "task": 9,
+      "width": 512,
+      "eta0": 1.0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.935679,
+      "last_roc": 0.935679,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.912527
+        },
+        {
+          "S": 400,
+          "roc": 0.924555
+        },
+        {
+          "S": 600,
+          "roc": 0.92833
+        },
+        {
+          "S": 800,
+          "roc": 0.934832
+        },
+        {
+          "S": 1000,
+          "roc": 0.935679
+        }
+      ],
+      "log": "jc_upool_xfer_14890706_9.out",
+      "partition": "gputest",
+      "pool": "uniform"
+    }
+  ],
+  "attn": [
+    {
+      "task": 0,
+      "width": 256,
+      "eta0": 0.05,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.936487,
+      "last_roc": 0.936487,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.923405
+        },
+        {
+          "S": 400,
+          "roc": 0.928776
+        },
+        {
+          "S": 600,
+          "roc": 0.934155
+        },
+        {
+          "S": 800,
+          "roc": 0.934727
+        },
+        {
+          "S": 1000,
+          "roc": 0.936487
+        }
+      ],
+      "log": "D256_eta0p05_R0p1.out",
+      "partition": "lambda",
+      "pool": "attn"
+    },
+    {
+      "task": 1,
+      "width": 256,
+      "eta0": 0.1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.936262,
+      "last_roc": 0.936262,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.924586
+        },
+        {
+          "S": 400,
+          "roc": 0.930547
+        },
+        {
+          "S": 600,
+          "roc": 0.933247
+        },
+        {
+          "S": 800,
+          "roc": 0.936063
+        },
+        {
+          "S": 1000,
+          "roc": 0.936262
+        }
+      ],
+      "log": "D256_eta0p1_R0p1.out",
+      "partition": "lambda",
+      "pool": "attn"
+    },
+    {
+      "task": 2,
+      "width": 256,
+      "eta0": 0.25,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.937419,
+      "last_roc": 0.937419,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.922455
+        },
+        {
+          "S": 400,
+          "roc": 0.927517
+        },
+        {
+          "S": 600,
+          "roc": 0.932889
+        },
+        {
+          "S": 800,
+          "roc": 0.935133
+        },
+        {
+          "S": 1000,
+          "roc": 0.937419
+        }
+      ],
+      "log": "D256_eta0p25_R0p1.out",
+      "partition": "lambda",
+      "pool": "attn"
+    },
+    {
+      "task": 3,
+      "width": 256,
+      "eta0": 0.5,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.936169,
+      "last_roc": 0.936169,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.919341
+        },
+        {
+          "S": 400,
+          "roc": 0.928714
+        },
+        {
+          "S": 600,
+          "roc": 0.92915
+        },
+        {
+          "S": 800,
+          "roc": 0.933447
+        },
+        {
+          "S": 1000,
+          "roc": 0.936169
+        }
+      ],
+      "log": "D256_eta0p5_R0p1.out",
+      "partition": "lambda",
+      "pool": "attn"
+    },
+    {
+      "task": 4,
+      "width": 256,
+      "eta0": 1.0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.934348,
+      "last_roc": 0.934348,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.914279
+        },
+        {
+          "S": 400,
+          "roc": 0.926564
+        },
+        {
+          "S": 600,
+          "roc": 0.928463
+        },
+        {
+          "S": 800,
+          "roc": 0.934117
+        },
+        {
+          "S": 1000,
+          "roc": 0.934348
+        }
+      ],
+      "log": "D256_eta1_R0p1.out",
+      "partition": "lambda",
+      "pool": "attn"
+    },
+    {
+      "task": 5,
+      "width": 512,
+      "eta0": 0.05,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.936946,
+      "last_roc": 0.936946,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.92413
+        },
+        {
+          "S": 400,
+          "roc": 0.929348
+        },
+        {
+          "S": 600,
+          "roc": 0.934318
+        },
+        {
+          "S": 800,
+          "roc": 0.934623
+        },
+        {
+          "S": 1000,
+          "roc": 0.936946
+        }
+      ],
+      "log": "D512_eta0p05_R0p1.out",
+      "partition": "lambda",
+      "pool": "attn"
+    },
+    {
+      "task": 6,
+      "width": 512,
+      "eta0": 0.1,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.93697,
+      "last_roc": 0.93697,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.922744
+        },
+        {
+          "S": 400,
+          "roc": 0.930335
+        },
+        {
+          "S": 600,
+          "roc": 0.933857
+        },
+        {
+          "S": 800,
+          "roc": 0.935401
+        },
+        {
+          "S": 1000,
+          "roc": 0.93697
+        }
+      ],
+      "log": "D512_eta0p1_R0p1.out",
+      "partition": "lambda",
+      "pool": "attn"
+    },
+    {
+      "task": 7,
+      "width": 512,
+      "eta0": 0.25,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.937528,
+      "last_roc": 0.937528,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.922755
+        },
+        {
+          "S": 400,
+          "roc": 0.929112
+        },
+        {
+          "S": 600,
+          "roc": 0.932785
+        },
+        {
+          "S": 800,
+          "roc": 0.935183
+        },
+        {
+          "S": 1000,
+          "roc": 0.937528
+        }
+      ],
+      "log": "D512_eta0p25_R0p1.out",
+      "partition": "lambda",
+      "pool": "attn"
+    },
+    {
+      "task": 8,
+      "width": 512,
+      "eta0": 0.5,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.935505,
+      "last_roc": 0.935505,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.920061
+        },
+        {
+          "S": 400,
+          "roc": 0.927186
+        },
+        {
+          "S": 600,
+          "roc": 0.927688
+        },
+        {
+          "S": 800,
+          "roc": 0.934356
+        },
+        {
+          "S": 1000,
+          "roc": 0.935505
+        }
+      ],
+      "log": "D512_eta0p5_R0p1.out",
+      "partition": "lambda",
+      "pool": "attn"
+    },
+    {
+      "task": 9,
+      "width": 512,
+      "eta0": 1.0,
+      "status": "done",
+      "step": 1000,
+      "max_steps": 1000,
+      "best_roc": 0.934117,
+      "last_roc": 0.934117,
+      "pts": [
+        {
+          "S": 200,
+          "roc": 0.917278
+        },
+        {
+          "S": 400,
+          "roc": 0.92347
+        },
+        {
+          "S": 600,
+          "roc": 0.925987
+        },
+        {
+          "S": 800,
+          "roc": 0.93257
+        },
+        {
+          "S": 1000,
+          "roc": 0.934117
+        }
+      ],
+      "log": "D512_eta1_R0p1.out",
+      "partition": "lambda",
+      "pool": "attn"
+    }
+  ]
+}

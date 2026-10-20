@@ -13,6 +13,7 @@ from cpen.graphs.graph_star import (
     build_star_radius_graph,
     part_interaction_features,
     part_interaction_preprocess,
+    robust_part_interaction_preprocess,
     standardize_part_interaction,
 )
 
@@ -135,9 +136,21 @@ def test_standardized_features_are_order_one_on_a_jet_sample():
         assert active[:, i].std() < 3.0, f"feature {i} is not Theta(1)"
 
 
-def test_preprocess_constants_selected_by_nearest_radius():
-    assert part_interaction_preprocess(0.15) == part_interaction_preprocess(0.16)
+def test_robust_preprocess_centers_features():
+    raw = torch.tensor([[0.0, 1.0, 2.0, 3.0], [2.0, 3.0, 4.0, 5.0], [4.0, 5.0, 6.0, 7.0]])
+    # pad a few copies so quantiles are stable
+    raw = raw.repeat(20, 1)
+    consts = robust_part_interaction_preprocess(raw)
+    std = standardize_part_interaction(raw, preprocess=consts)
+    assert torch.isfinite(std).all()
+    assert std.median(dim=0).values.abs().max() < 0.2
+
+
+def test_preprocess_constants_require_exact_radius():
     assert part_interaction_preprocess(0.15) != part_interaction_preprocess(0.20)
+    assert part_interaction_preprocess(0.10) != part_interaction_preprocess(0.15)
+    with pytest.raises(ValueError, match="no part-interaction preprocess"):
+        part_interaction_preprocess(0.16)
 
 
 def test_standardization_is_invertible():

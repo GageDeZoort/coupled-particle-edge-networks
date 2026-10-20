@@ -136,6 +136,69 @@ def read_ckpt_global_step(path: str | Path) -> int:
         return 0
 
 
+def _unfreeze_readout(model: nn.Module) -> list[str]:
+    """Enable grads on decoder / attentional pool / class-token heads."""
+    names: list[str] = []
+    for name in (
+        "decoder_x",
+        "decoder_e",
+        "decoder",
+        "output_attention_pool",
+        "class_tokens",
+        "class_unembed",
+        "attn_x",
+        "attn_e",
+    ):
+        head = getattr(model, name, None)
+        if head is None:
+            continue
+        if isinstance(head, nn.Parameter):
+            head.requires_grad = True
+            names.append(name)
+            continue
+        n_p = 0
+        for p in head.parameters():
+            p.requires_grad = True
+            n_p += 1
+        if n_p:
+            names.append(name)
+    # Also catch any leftover params whose names look like readout.
+    for pname, p in model.named_parameters():
+        if is_readout_param(pname):
+            p.requires_grad = True
+    return names
+
+
+def freeze_backbone_train_readout(model: nn.Module) -> dict[str, Any]:
+    """Freeze the full trunk; train only a freshly initialized readout head.
+
+    Used for JetClass→TopTagging head-only fine-tunes: pretrained encoder +
+    blocks stay fixed; attentional pool / decoder get gradients.
+    """
+    for p in model.parameters():
+        p.requires_grad = False
+    head_names = _unfreeze_readout(model)
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    info = {
+        "n_blocks": 0,
+        "trainable_block_indices": [],
+        "trainable_heads": head_names,
+        "n_trainable_params": int(n_train),
+        "n_total_params": int(n_total),
+        "trainable_frac": float(n_train) / max(float(n_total), 1.0),
+    }
+    log_info(
+        f"[freeze] backbone frozen — train readout only {head_names} | "
+        f"trainable {n_train:,}/{n_total:,} ({100 * info['trainable_frac']:.1f}%)"
+    )
+    if n_train <= 0:
+        raise RuntimeError(
+            "freeze_backbone_train_readout: no trainable readout params found"
+        )
+    return info
+
+
 def freeze_except_last_blocks(model: nn.Module, n_blocks: int = 1) -> dict[str, Any]:
     """Freeze encoder + early blocks; train the last ``n_blocks`` + decoders / readout.
 
@@ -171,15 +234,7 @@ def freeze_except_last_blocks(model: nn.Module, n_blocks: int = 1) -> dict[str, 
             for p in modlist[i].parameters():
                 p.requires_grad = True
 
-    for name in ("decoder_x", "decoder_e", "decoder", "output_attention_pool"):
-        head = getattr(model, name, None)
-        if head is None:
-            continue
-        if isinstance(head, nn.Parameter):
-            head.requires_grad = True
-            continue
-        for p in head.parameters():
-            p.requires_grad = True
+    _unfreeze_readout(model)
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())

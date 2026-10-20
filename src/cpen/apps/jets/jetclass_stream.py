@@ -366,9 +366,13 @@ def split_plan_over_replicas(
 
     Without this, every rank iterates the full stream and an epoch has
     ``world_size`` times as many optimizer steps as a unique pass at global
-    batch ``batch_size * world_size``. Replica slices are class-balanced the
-    same way as workers. When ``world_size > 1`` every replica is truncated to
-    the shortest replica so DDP ranks exhaust on the same step.
+    batch ``batch_size * world_size``.
+
+    Multi-GPU replicas take equal-length class-interleaved segments of the
+    full plan (offset ``replica_id * quota``). Dealing shards round-robin and
+    truncating to the shortest replica under-counts after a large
+    ``train_skip`` when file-aligned chunks make replica sizes uneven
+    (e.g. skip=768k → ~667 steps instead of 1000).
     """
     world_size = max(1, int(world_size))
     num_workers = max(1, int(num_workers))
@@ -378,12 +382,14 @@ def split_plan_over_replicas(
         return split_plan_over_workers(shards, worker_id, num_workers)
     n_replicas = world_size * num_workers
     replica_id = rank * num_workers + worker_id
-    plan = split_plan_over_workers(shards, replica_id, n_replicas)
-    quota = min(
-        sum(s.n_jets for s in split_plan_over_workers(shards, i, n_replicas))
-        for i in range(n_replicas)
-    )
-    return take_round_robin_shards(plan, quota)
+    total = sum(s.n_jets for s in shards)
+    if total <= 0:
+        return []
+    quota = total // n_replicas
+    if quota <= 0:
+        return []
+    offset = replica_id * quota
+    return take_round_robin_shards(skip_round_robin_shards(list(shards), offset), quota)
 
 
 def chunk_size_for_workers(n_jets: int | None, num_workers: int) -> int:

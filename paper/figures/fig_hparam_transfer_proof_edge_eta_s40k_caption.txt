@@ -1,0 +1,6 @@
+Figure. Learning-rate transfer under the frozen graph-construction OP.
+Holdout validation ROC–AUC after up to 40 000 Adam steps at constant peak LR
+η = η₀/√D versus base learning rate η₀, for (L, D) ∈ {(4, 256), (6, 512)}
+(d_h=32, B_eff=256, k★=7, R★=0.1, noloop, single-pass stream).
+Open markers = mid-run (<95% of 40k). 15/17 cells finished.
+L4/D256 peak η₀=0.1 (ROC=0.95571 @ 40000; done); L6/D512 peak η₀=0.075 (ROC=0.95643 @ 40000; 6/8 done).

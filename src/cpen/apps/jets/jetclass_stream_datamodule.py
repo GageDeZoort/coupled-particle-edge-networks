@@ -65,6 +65,7 @@ class JetClassStreamDatamodule(BaseDatamodule):
         shuffle_buffer: int | None = None,
         sort_by_pt: bool = False,
         train_skip_jets: int = 0,
+        expected_world_size: int = 1,
     ) -> None:
         super().__init__(data_root, batch_size, num_workers=num_workers)
         self.num_particles = int(num_particles)
@@ -79,6 +80,11 @@ class JetClassStreamDatamodule(BaseDatamodule):
         self.shuffle_buffer = 0 if shuffle_buffer is None else int(shuffle_buffer)
         self.sort_by_pt = bool(sort_by_pt)
         self.train_skip_jets = max(0, int(train_skip_jets))
+        # DDP world size used to size stream chunks *before* the Lightning
+        # trainer is attached (γ estimate / early setup). Under-sharding relative
+        # to world×workers makes every replica empty and fit ends at step 0.
+        self.expected_world_size = max(1, int(expected_world_size))
+        self._stream_replicas_planned: int | None = None
         self.n_particles = self.num_particles
         # Validate eagerly so a typo fails before any ROOT file is opened.
         feature_names(self.feature_config)
@@ -92,7 +98,13 @@ class JetClassStreamDatamodule(BaseDatamodule):
 
     @property
     def streaming(self) -> bool:
-        """Whether the training split is streamed rather than resident."""
+        """Whether the training split is streamed rather than resident.
+
+        Force streaming whenever ``train_skip_jets > 0``: the RAM subset path
+        ignores skip and would make every "shard" identical (panel-b collapse).
+        """
+        if self.train_skip_jets > 0:
+            return True
         return self.n_train_limit is None or self.n_train_limit > RAM_SUBSET_LIMIT
 
     def get_dims(self) -> tuple[int, int]:
@@ -132,6 +144,12 @@ class JetClassStreamDatamodule(BaseDatamodule):
         rank = int(getattr(trainer, "global_rank", 0) or 0)
         return rank, max(1, world)
 
+    def _stream_replica_count(self) -> int:
+        """DataLoader replicas the stream plan must cover (workers × DDP world)."""
+        _, world = self._ddp_identity()
+        world = max(world, self.expected_world_size)
+        return max(1, int(self.num_workers or 0)) * max(1, world)
+
     def _apply_ddp_to_stream(self, dataset: JetClassStreamDataset) -> None:
         """Stamp rank/world on the dataset before DataLoader workers pickle it."""
         rank, world = self._ddp_identity()
@@ -142,27 +160,31 @@ class JetClassStreamDatamodule(BaseDatamodule):
         self._ensure_dataset_stats()
         if self.streaming:
             rank, world = self._ddp_identity()
+            # Prefer the live trainer world once attached; otherwise the CLI
+            # ``--n-gpus`` hint so γ-estimate setup does not under-shard.
+            world_for_plan = max(world, self.expected_world_size)
+            n_replicas = self._stream_replica_count()
             dataset = JetClassStreamDataset(
                 self.data_root,
                 "train",
                 n_jets=self.n_train_limit,
                 num_particles=self.num_particles,
                 feature_config=self.feature_config,
-                chunk_size=chunk_size_for_workers(
-                    self.n_train_limit, max(1, self.num_workers) * world
-                ),
+                chunk_size=chunk_size_for_workers(self.n_train_limit, n_replicas),
                 shuffle_seed=self.shuffle_seed,
                 shuffle_buffer=self.shuffle_buffer,
                 sort_by_pt=self.sort_by_pt,
                 skip_jets=self.train_skip_jets,
                 ddp_rank=rank,
-                ddp_world_size=world,
+                ddp_world_size=world_for_plan,
             )
+            self._stream_replicas_planned = n_replicas
             log_info(
                 f"[graphs] split=train mode=stream (single pass) "
                 f"n_jets={dataset.n_jets:,} skip={self.train_skip_jets:,} "
                 f"features={self.feature_config} "
-                f"n_particles={self.num_particles} shuffle_buffer={self.shuffle_buffer}"
+                f"n_particles={self.num_particles} shuffle_buffer={self.shuffle_buffer} "
+                f"replicas={n_replicas} (workers={self.num_workers} world={world_for_plan})"
             )
             return dataset
         dataset = self._subset("train", int(self.n_train_limit))
@@ -175,11 +197,32 @@ class JetClassStreamDatamodule(BaseDatamodule):
 
     def _build_val_dataset(self) -> Dataset:
         self._ensure_dataset_stats()
-        return self._subset("val", int(self.n_val_limit))
+        n = int(self.n_val_limit) if self.n_val_limit is not None else 0
+        # Train-only / checkpoint-later runs pass --n-val 0 (no val ROOT needed).
+        if n <= 0:
+            from torch.utils.data import TensorDataset
+            import torch
+
+            return TensorDataset(torch.empty(0, dtype=torch.long))
+        return self._subset("val", n)
 
     def _build_test_dataset(self) -> Dataset:
         self._ensure_dataset_stats()
-        return self._subset("test", int(self.n_test_limit))
+        n = int(self.n_test_limit) if self.n_test_limit is not None else 0
+        # Fast sweeps pass --n-test 0 to skip post-fit test; empty subset
+        # previously crashed np.concatenate. Return a 0-length subset only if
+        # the builder can handle it; otherwise build a tiny 1-jet placeholder
+        # is wrong — prefer empty-capable path via n_jets=max(n,0) guard in
+        # JetClassSubsetDataset. When n<=0, avoid building altogether by using
+        # a 0-jet stream subset that short-circuits.
+        if n <= 0:
+            from torch.utils.data import TensorDataset
+            import torch
+
+            # Lightning still asks for a test dataloader; a zero-length
+            # TensorDataset makes test finish immediately with no batches.
+            return TensorDataset(torch.empty(0, dtype=torch.long))
+        return self._subset("test", n)
 
     def build_datasets(self) -> tuple[Dataset, Dataset, Dataset]:
         return (
@@ -211,18 +254,37 @@ class JetClassStreamDatamodule(BaseDatamodule):
         """Jets already consumed on this rank, from a restored Lightning trainer.
 
         Uses ``global_step`` (optimizer steps across the whole run), not the
-        in-epoch batch counter. Streaming is a single pass: a preempted job
-        must continue through the ROOT files, not rewind to the epoch prefix.
+        in-epoch batch counter. Within one data-epoch a preempted job must
+        continue through the ROOT files (not rewind). Across epochs the skip
+        wraps in *jet* space: ``train_steps_per_epoch`` is slightly above
+        ``n/(B·world)`` because of per-worker partial batches, so a step-modulo
+        at the epoch boundary still lands past EOF and Lightning spins empty
+        epochs at a frozen global_step.
         """
         trainer = getattr(self, "_trainer", None) or vars(self).get("trainer")
         if trainer is None:
             return 0
         step = int(getattr(trainer, "global_step", 0) or 0)
-        return max(0, step) * int(self.batch_size)
+        raw = max(0, step) * int(self.batch_size)
+        if isinstance(self._train, JetClassStreamDataset):
+            n = int(getattr(self._train, "n_jets", 0) or 0)
+            _, world = self._ddp_identity()
+            world = max(1, int(world), int(getattr(self, "expected_world_size", 1) or 1))
+            period = max(1, n // world) if n > 0 else 0
+            if period > 0:
+                raw = raw % period
+        return raw
 
     def train_dataloader(self) -> DataLoader:
         assert self._train is not None
         if isinstance(self._train, JetClassStreamDataset):
+            needed = self._stream_replica_count()
+            if self._stream_replicas_planned != needed:
+                # Trainer world now known (or changed): rebuild so chunk sizing
+                # matches world×workers. Otherwise replicas can be empty and
+                # Lightning ends the epoch at global_step=0 with exit 0.
+                self._train = self._build_train_dataset()
+                assert isinstance(self._train, JetClassStreamDataset)
             self._apply_ddp_to_stream(self._train)
             skip = self._resume_skip_jets()
             self._train.skip_jets = skip
@@ -231,6 +293,17 @@ class JetClassStreamDatamodule(BaseDatamodule):
                 log_info(
                     f"[graphs] stream resume skip_jets={skip:,} "
                     f"(batch_size={self.batch_size} rank={rank}/{world})"
+                )
+            # Fail fast: empty replica plans used to look like a successful 0-step fit.
+            rank, world = self._ddp_identity()
+            probe = sum(s.n_jets for s in self._train._worker_shards())
+            if probe <= 0:
+                raise RuntimeError(
+                    f"[graphs] stream plan empty on rank {rank}/{world} "
+                    f"(workers={self.num_workers}, skip={self.train_skip_jets}, "
+                    f"replicas_planned={self._stream_replicas_planned}). "
+                    "Increase expected_world_size / shrink chunk size so every "
+                    "replica receives jets."
                 )
             # Shuffling happens inside the worker's buffer; DataLoader must not
             # try to shuffle an IterableDataset.
@@ -266,6 +339,10 @@ class JetClassStreamDatamodule(BaseDatamodule):
         ):
             if dataset is not None:
                 sizes[key] = int(getattr(dataset, "n_jets", len(dataset)))
+            elif limit is not None and int(limit) <= 0:
+                # Train-only / no-test runs must not require val_5M / test_20M
+                # ROOT trees on disk (probe runs before setup builds empties).
+                sizes[key] = 0
             else:
                 sizes[key] = self._planned_size(split, limit)
         return sizes

@@ -2,10 +2,11 @@
 # JetClass → TopTagging fine-tune (live star-R + kNN, matched to pretrain).
 #
 #   INIT_FROM=/path/to/jetclass/last.ckpt \
-#   ETA0=0.5 WIDTH=384 HEAD=12 NUM_PARTICLES=80 \
+#   ETA0=0.1 WIDTH=512 HEAD=16 STAR_R=0.1 UNIFORM_POOL=1 \
 #   sbatch scans/jets/finetune_toptagging_from_jetclass.slurm
 #
 # Omitting ETA0 defaults to the pretrain η₀ stored in the ckpt.
+# For gpu-test: pass --time=0:59:00 on sbatch (or use the submit_*.sh helpers).
 #
 #SBATCH --account=bhanin
 #SBATCH --job-name=tt-ft-jc
@@ -16,7 +17,7 @@
 #SBATCH --partition=a100
 #SBATCH --mem=256G
 #SBATCH --gres=gpu:4
-#SBATCH --time=1:30:00
+#SBATCH --time=0:59:00
 #SBATCH --output=/scratch/gpfs/BHANIN/jdezoort/cpen_runs/toptagging_finetune/logs/tt_ft_%j.out
 #SBATCH --error=/scratch/gpfs/BHANIN/jdezoort/cpen_runs/toptagging_finetune/logs/tt_ft_%j.err
 
@@ -32,33 +33,40 @@ mkdir -p "$FT_ROOT/logs"
 
 INIT_FROM="${INIT_FROM:?Set INIT_FROM to a JetClass pretrain Lightning .ckpt}"
 DEPTH="${DEPTH:-4}"
-WIDTH="${WIDTH:-384}"
-HEAD="${HEAD:-12}"
+WIDTH="${WIDTH:-512}"
+HEAD="${HEAD:-16}"
 BATCH="${BATCH:-128}"
 N_GPUS="${N_GPUS:-4}"
 NUM_PARTICLES="${NUM_PARTICLES:-80}"
-STAR_R="${STAR_R:-0.2}"
+STAR_R="${STAR_R:-0.1}"
 KNN_K="${KNN_K:-6}"
-MAX_STEPS="${MAX_STEPS:-20000}"
+MAX_STEPS="${MAX_STEPS:-5000}"
 EPOCHS="${EPOCHS:-50}"
 N_VAL="${N_VAL:-20000}"
 SEED="${SEED:-0}"
 RUN_TAG="${RUN_TAG:-ft-L${DEPTH}D${WIDTH}-b${BATCH}-g${N_GPUS}}"
+UNIFORM_POOL="${UNIFORM_POOL:-1}"
 
 ETA_ARGS=()
 if [[ -n "${ETA0:-}" ]]; then
   ETA_ARGS=(--etas "$ETA0")
 fi
 
+POOL_ARGS=()
+if [[ "$UNIFORM_POOL" == "1" || "$UNIFORM_POOL" == "true" ]]; then
+  POOL_ARGS=(--uniform-output-pool)
+fi
+
 echo "PWD=$(pwd)"
 echo "Host: $(hostname)"
 echo "SLURM_JOB_ID=$SLURM_JOB_ID"
 echo "init_from=$INIT_FROM"
-echo "L=$DEPTH D=$WIDTH H=$HEAD P=$NUM_PARTICLES starR=$STAR_R knn=$KNN_K"
-echo "eta0=${ETA0:-from-ckpt} max_steps=$MAX_STEPS root=$FT_ROOT"
+echo "L=$DEPTH D=$WIDTH H=$HEAD P=$NUM_PARTICLES starR=$STAR_R knn=$KNN_K uniform_pool=$UNIFORM_POOL"
+echo "eta0=${ETA0:-from-ckpt} max_steps=$MAX_STEPS root=$FT_ROOT run_tag=$RUN_TAG"
 
 export PYTHONFAULTHANDLER=1
 export PYTHONNOUSERSITE=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 python - <<'PY'
 import os, sys, torch
@@ -69,6 +77,8 @@ print(
     f"count={torch.cuda.device_count()}  "
     f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}"
 )
+if torch.cuda.device_count() < int(os.environ.get("N_GPUS", "4")):
+    print(f"WARNING: expected ≥4 GPUs, visible={torch.cuda.device_count()}")
 PY
 
 python test_cpen_toptagging_ft.py \
@@ -82,9 +92,11 @@ python test_cpen_toptagging_ft.py \
   --num-particles "$NUM_PARTICLES" \
   --mode sweep_lr \
   --optimizer adam \
+  --scheduler none \
   --t-epoch 1 \
   --residual-structure transformer-like \
   "${ETA_ARGS[@]}" \
+  "${POOL_ARGS[@]}" \
   --epochs "$EPOCHS" \
   --max-steps "$MAX_STEPS" \
   --data-root /scratch/gpfs/BHANIN/jdezoort/datasets/toptagging \

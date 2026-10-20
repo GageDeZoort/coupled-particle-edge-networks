@@ -17,5 +17,14 @@ logs/
 *#*
 *~*
 # Local-only superseded graph-construction artifacts
-scans/jets/archive/
+scans/jets/archive/**
+!scans/jets/archive/README.md
+!scans/jets/archive/**/README.md
 paper/archive/
+# Lab / Slurm ephemeral
+*jobid*.txt
+*_meta.txt
+scans/**/slurm-*.err
+scans/**/slurm-*.out
+.cache/
+**/__pycache__/

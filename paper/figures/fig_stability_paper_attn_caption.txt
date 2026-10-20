@@ -1,0 +1,11 @@
+Fig. fig_stability_paper_attn. One-step Adam feature norms/updates for CAPEN-Llama-att
+(η = η₀/√D) at k★=12, R★=0.1. Pool=attn. L∈{4}, d_h=?.
+D∈{64,128,256,384,512,768}. η₀ ∈ {0.01, 0.05, 0.1, 0.25, 0.5, 1}.
+Each point is mean over 100 trials (model seeds × data shards); SEM ≪ marker size so error bars are omitted.
+Combo: row1 pre-step ρ (color=X/E); row2 Δρ (color=stream, linestyle=η₀∈{0.25,0.5,1}).
+Depth-scaling rows will append below when ready.
+Files: fig_stability_paper_attn.png (Δρ), fig_stability_paper_attn_rho.png (ρ), fig_stability_paper_attn_combo.png.
+Columns: encoder (ℓ=0), last residual (ℓ=L), readout (ℓ=L+1).
+Δρ = ||ΔZ||_F² / (N_live · d); ρ = ||Z||_F² / (N_live · d)
+with d = D (hidden) or C (readout).
+Source: paper/data/stability_one_step_*paper*.csv.

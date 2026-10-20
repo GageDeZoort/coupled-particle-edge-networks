@@ -18,6 +18,7 @@ from cpen.apps.jets.jetclass_stream import (
     n_features,
     chunk_size_for_workers,
     plan_shards,
+    split_plan_over_replicas,
     split_plan_over_workers,
     steps_per_epoch,
 )
@@ -350,6 +351,43 @@ def test_datamodule_switches_to_streaming_above_the_ram_limit():
     big = _datamodule(n_train=None)
     assert big.streaming
     assert isinstance(big._build_train_dataset(), Stream)
+
+
+def test_train_skip_forces_stream_and_sizes_chunks_for_ddp_world():
+    """
+    Shard offsets force streaming. Chunk sizing must use expected DDP world
+    *before* the trainer attaches; otherwise world×workers replicas are empty
+    and Lightning ends fit at global_step=0 (v6gt2 empty-train bug).
+    """
+    from cpen.apps.jets.jetclass_stream import JetClassStreamDataset as Stream
+
+    dm = _datamodule(
+        n_train=384_000,
+        train_skip_jets=384_000,
+        num_workers=4,
+        expected_world_size=4,
+        n_test=0,
+    )
+    assert dm.streaming
+    assert dm._stream_replica_count() == 16
+    ds = dm._build_train_dataset()
+    assert isinstance(ds, Stream)
+    assert dm._stream_replicas_planned == 16
+    sizes = [
+        sum(
+            s.n_jets
+            for s in split_plan_over_replicas(
+                ds.shards,
+                rank=rank,
+                world_size=4,
+                worker_id=worker,
+                num_workers=4,
+            )
+        )
+        for rank in range(4)
+        for worker in range(4)
+    ]
+    assert min(sizes) > 0, f"empty replicas: {sizes}"
 
 
 def test_probe_split_sizes_answers_before_setup():

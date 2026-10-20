@@ -1,0 +1,15 @@
+Figure. Graph construction and η₀-transfer on JetClass.
+Canonical graph: all-seed star-R hyperedges with kin7 aggregate features plus
+ΔR-kNN (noloop) part-interaction edges (tag sk7 / v2cpNL).
+(a) Holdout validation ROC–AUC after 2500 Adam steps versus kNN degree k at fixed
+star radius R★ = 0.1 (CompletenessP v2: B_global=128, D=256, L=4). Each point is
+the mean over n = 6 independent training cells (three disjoint 320k-jet shards ×
+two seeds). Error bars denote the sample standard deviation (s.d.) across those
+cells, not the s.e.m. k ∈ {2,…,10}. Peak at k★ = 7 (mean ROC ≈ 0.9391).
+Inset: mean directed ΔR-kNN edges per jet.
+Panel (a) still filling.
+(b) Same protocol versus star radius R★ at k★ = 7. ROC cells: 0/42.
+Performance is flat for R ∈ [0.08, 0.14] (≈ 0.9391); operating point R★ = 0.1.
+(c) Edge ablation η₀×D at (k★, R★)=(7, 0.1): pending re-run at
+the frozen OP (prior cells used k★=6). Dashed = M11; solid = edges.
+M11: 0/18; edges: 9/18.

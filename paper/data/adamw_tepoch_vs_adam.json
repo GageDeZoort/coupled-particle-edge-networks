@@ -1,0 +1,62 @@
+{
+  "adam_auc": 0.9557061195373535,
+  "adam_step": 40000,
+  "cells": [
+    {
+      "t": 0.1,
+      "step": 38500,
+      "auc": null,
+      "loss": 0.822854,
+      "delta": null,
+      "src": "ckpt"
+    },
+    {
+      "t": 0.5,
+      "step": 37000,
+      "auc": null,
+      "loss": 0.819017,
+      "delta": null,
+      "src": "ckpt"
+    },
+    {
+      "t": 1.0,
+      "step": 36800,
+      "auc": null,
+      "loss": 0.786604,
+      "delta": null,
+      "src": "ckpt"
+    },
+    {
+      "t": 5.0,
+      "step": 36750,
+      "auc": null,
+      "loss": 0.827989,
+      "delta": null,
+      "src": "ckpt"
+    },
+    {
+      "t": 10.0,
+      "step": null,
+      "auc": null,
+      "loss": null,
+      "delta": null,
+      "src": "\u2014"
+    },
+    {
+      "t": 25.0,
+      "step": null,
+      "auc": null,
+      "loss": null,
+      "delta": null,
+      "src": "\u2014"
+    },
+    {
+      "t": 50.0,
+      "step": null,
+      "auc": null,
+      "loss": null,
+      "delta": null,
+      "src": "\u2014"
+    }
+  ]
+}

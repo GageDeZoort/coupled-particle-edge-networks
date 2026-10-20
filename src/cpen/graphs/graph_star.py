@@ -118,11 +118,29 @@ def part_interaction_features(
 
 
 #: Per-feature ``(subtract, multiply)`` for :func:`part_interaction_features`,
-#: keyed by star radius, in the same spirit as the ParT/Weaver node-feature
-#: constants. Robust statistics (median, ``1.35 / IQR``) measured on 24k
-#: JetClass train jets across six classes; robust rather than mean/std because
-#: the floored degenerate hyperedges form a spike well outside the bulk.
+#: keyed by star radius. Robust statistics (median, ``1.35 / IQR``) on JetClass
+#: train jets; robust rather than mean/std because floored degenerate hyperedges
+#: form a spike well outside the bulk.
+#:
+#: ``0.15`` / ``0.20`` were measured on star-only hyperedges (~24k jets).
+#: ``0.10`` / ``0.125`` are measured on the **production** star+\(k\)NN edge
+#: stream at ``k=12`` (2.4k jets, 6 classes) — silent nearest-key fallback is
+#: forbidden because wrong Θ(1) scaling breaks edge-encoder μP.
 PART_INTERACTION_PREPROCESS: dict[float, tuple[tuple[float, float], ...]] = {
+    # star + ΔR-kNN (k=12) live stream — panel (a)/(b)/(c) operating points
+    0.10: (
+        (-2.84, 0.945),  # ln Delta
+        (-1.43, 0.878),  # ln k_T
+        (-1.25, 1.346),  # ln z
+        (-0.98, 0.515),  # ln m^2
+    ),
+    0.125: (
+        (-2.82, 0.958),  # ln Delta
+        (-1.41, 0.885),  # ln k_T
+        (-1.26, 1.338),  # ln z
+        (-0.95, 0.512),  # ln m^2
+    ),
+    # star-only hyperedges (legacy caches / older R★=0.15–0.20 runs)
     0.15: (
         (-3.13, 0.962),  # ln Delta
         (-1.38, 0.906),  # ln k_T
@@ -139,21 +157,70 @@ PART_INTERACTION_PREPROCESS: dict[float, tuple[tuple[float, float], ...]] = {
 
 EDGE_FEATURE_MODES = ("logdot-dp", "part-interaction")
 
+_PREPROCESS_RADIUS_ATOL = 1e-6
 
-def part_interaction_preprocess(radius: float) -> tuple[tuple[float, float], ...]:
-    """Standardization constants for the star radius nearest to ``radius``."""
-    return PART_INTERACTION_PREPROCESS[
-        min(PART_INTERACTION_PREPROCESS, key=lambda r: abs(r - radius))
-    ]
+#: ``((subtract, multiply), …)`` × 4 features — see :func:`standardize_part_interaction`.
+PartInteractionPreprocess = tuple[tuple[float, float], ...]
+
+
+def part_interaction_preprocess(radius: float) -> PartInteractionPreprocess:
+    """Exact-key table lookup for ``radius`` (no nearest-key fallback).
+
+    Prefer :func:`robust_part_interaction_preprocess` / live-batch estimation for
+    production star+kNN graphs — table entries are geometry-specific.
+    """
+    r = float(radius)
+    for key, consts in PART_INTERACTION_PREPROCESS.items():
+        if abs(float(key) - r) <= _PREPROCESS_RADIUS_ATOL:
+            return consts
+    known = ", ".join(str(k) for k in sorted(PART_INTERACTION_PREPROCESS))
+    raise ValueError(
+        f"no part-interaction preprocess constants for star radius R={r:g}; "
+        f"known keys: {known}. Estimate from the live edge stream "
+        f"(default in training) or add an entry to PART_INTERACTION_PREPROCESS."
+    )
+
+
+def robust_part_interaction_preprocess(
+    raw_features: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> PartInteractionPreprocess:
+    """Median / ``1.35·IQR`` constants from raw ``(..., 4)`` interaction features."""
+    if raw_features.numel() == 0:
+        raise ValueError("robust_part_interaction_preprocess needs at least one live edge")
+    flat = raw_features.detach().float().reshape(-1, 4)
+    if flat.size(0) < 1:
+        raise ValueError("robust_part_interaction_preprocess needs at least one live edge")
+    q25 = torch.quantile(flat, 0.25, dim=0)
+    q50 = torch.quantile(flat, 0.50, dim=0)
+    q75 = torch.quantile(flat, 0.75, dim=0)
+    iqr = (q75 - q25).clamp_min(eps)
+    mul = 1.35 / iqr
+    return tuple(
+        (float(q50[i].item()), float(mul[i].item())) for i in range(4)
+    )
 
 
 def standardize_part_interaction(
     edge_x: torch.Tensor,
     *,
-    radius: float,
+    radius: float | None = None,
+    preprocess: PartInteractionPreprocess | None = None,
 ) -> torch.Tensor:
-    """Center and scale raw interaction features to $\\Theta(1)$."""
-    preprocess = part_interaction_preprocess(radius)
+    """Center and scale raw interaction features to $\\Theta(1)$.
+
+    Pass ``preprocess`` from a live-batch estimate whenever possible; ``radius``
+    table lookup is only a fallback for unit tests / legacy caches.
+    """
+    if preprocess is None:
+        if radius is None:
+            raise ValueError(
+                "standardize_part_interaction requires preprocess=... or radius=..."
+            )
+        preprocess = part_interaction_preprocess(radius)
+    if len(preprocess) != 4:
+        raise ValueError(f"preprocess must have 4 (sub, mul) pairs; got {len(preprocess)}")
     shift = edge_x.new_tensor([c for c, _ in preprocess])
     scale = edge_x.new_tensor([s for _, s in preprocess])
     return (edge_x - shift) * scale
@@ -209,6 +276,8 @@ def build_star_radius_graph(
     mask: torch.Tensor | None = None,
     edge_features: str = "logdot-dp",
     centroid_weight: str | None = None,
+    part_interaction_preprocess: PartInteractionPreprocess | None = None,
+    standardize: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Batched star hypergraph in $(\\eta, \\phi)$.
@@ -271,10 +340,31 @@ def build_star_radius_graph(
     if edge_features == "logdot-dp":
         edge_x = lorentz_edge_features(x_raw, centroid)
     else:
-        edge_x = standardize_part_interaction(
-            part_interaction_features(x_raw, centroid),
-            radius=radius,
-        )
+        raw = part_interaction_features(x_raw, centroid)
+        if standardize:
+            pp = part_interaction_preprocess
+            if pp is None:
+                r = float(radius)
+                pp = next(
+                    (
+                        consts
+                        for key, consts in PART_INTERACTION_PREPROCESS.items()
+                        if abs(float(key) - r) <= _PREPROCESS_RADIUS_ATOL
+                    ),
+                    None,
+                )
+                if pp is None:
+                    active = center_active.squeeze(-1) > 0.5
+                    live = raw[active]
+                    if live.numel() == 0:
+                        raise ValueError(
+                            f"no live star edges to estimate part-interaction "
+                            f"preprocess at R={r:g}"
+                        )
+                    pp = robust_part_interaction_preprocess(live)
+            edge_x = standardize_part_interaction(raw, preprocess=pp)
+        else:
+            edge_x = raw
     edge_x = edge_x * center_active
 
     if batch == 1:
@@ -293,16 +383,25 @@ def build_delta_r_knn_edges(
     mask: torch.Tensor | None = None,
     edge_features: str = "part-interaction",
     radius: float = 0.2,
+    part_interaction_preprocess: PartInteractionPreprocess | None = None,
+    standardize: bool = True,
+    include_self: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Directed ΔR-kNN 2-edges among particles.
+
+    By default ``include_self=False``: self is masked to \(+\infty\) so the \(k\)
+    slots are true neighbors. Particle self-attention already lives in M11;
+    forcing self into kNN created floored part-interaction spikes and made
+    CLI \(k{=}1\) a self-loop-only control rather than one neighbor.
 
     Returns
     -------
     edge_x:
         ``(B, N·k, 4)`` — empty for padded / inactive slots.
     incidence:
-        ``(B, N·k, N)`` — each live slot is a deg-1 (self) or deg-2 edge.
+        ``(B, N·k, N)`` — each live slot is a deg-2 edge (or deg-1 only if
+        ``include_self=True`` and the self slot is selected).
     """
     if k < 1:
         raise ValueError(f"k must be >= 1; got {k}")
@@ -316,7 +415,8 @@ def build_delta_r_knn_edges(
     batch, n_particles, _ = x_raw.shape
     device = x_raw.device
     dtype = x_raw.dtype
-    knn_k = min(int(k), n_particles)
+    # When excluding self, at most N-1 neighbors exist.
+    knn_k = min(int(k), max(n_particles - (0 if include_self else 1), 1))
     n_slots = n_particles * int(k)
 
     eta, phi = eta_phi_from_four_vectors_torch(x_raw)
@@ -324,8 +424,11 @@ def build_delta_r_knn_edges(
     pair_ok = mask.unsqueeze(-1) & mask.unsqueeze(-2)
     dr = dr.masked_fill(~pair_ok, float("inf"))
     eye = torch.eye(n_particles, device=device, dtype=torch.bool).unsqueeze(0)
-    # Include self at distance 0 so every active particle has at least one slot.
-    dr = torch.where(eye & mask.unsqueeze(-1), torch.zeros_like(dr), dr)
+    if include_self:
+        # Legacy: self at distance 0 so every active particle has ≥1 finite slot.
+        dr = torch.where(eye & mask.unsqueeze(-1), torch.zeros_like(dr), dr)
+    else:
+        dr = dr.masked_fill(eye, float("inf"))
 
     knn_dist, knn_idx = dr.topk(knn_k, dim=-1, largest=False)
     finite = torch.isfinite(knn_dist) & mask.unsqueeze(-1)
@@ -358,10 +461,24 @@ def build_delta_r_knn_edges(
         if edge_features == "logdot-dp":
             feats = lorentz_edge_features(p_s.unsqueeze(1), p_d.unsqueeze(1)).squeeze(1)
         else:
-            feats = standardize_part_interaction(
-                part_interaction_features(p_s, p_d),
-                radius=radius,
-            )
+            raw = part_interaction_features(p_s, p_d)
+            if standardize:
+                pp = part_interaction_preprocess
+                if pp is None:
+                    r = float(radius)
+                    pp = next(
+                        (
+                            consts
+                            for key, consts in PART_INTERACTION_PREPROCESS.items()
+                            if abs(float(key) - r) <= _PREPROCESS_RADIUS_ATOL
+                        ),
+                        None,
+                    )
+                    if pp is None:
+                        pp = robust_part_interaction_preprocess(raw)
+                feats = standardize_part_interaction(raw, preprocess=pp)
+            else:
+                feats = raw
         edge_x[flat_b, flat_e] = feats.to(dtype)
     return edge_x, incidence
 
@@ -374,6 +491,9 @@ def build_star_plus_knn_graph(
     mask: torch.Tensor | None = None,
     edge_features: str = "part-interaction",
     centroid_weight: str | None = None,
+    part_interaction_preprocess: PartInteractionPreprocess | None = None,
+    standardize: bool = True,
+    include_self: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Concatenate star-$R$ hyperedges with directed ΔR-kNN 2-edges.
@@ -388,6 +508,8 @@ def build_star_plus_knn_graph(
         mask=mask,
         edge_features=edge_features,
         centroid_weight=centroid_weight,
+        part_interaction_preprocess=part_interaction_preprocess,
+        standardize=standardize,
     )
     knn_x, knn_inc = build_delta_r_knn_edges(
         x_raw,
@@ -395,8 +517,88 @@ def build_star_plus_knn_graph(
         mask=mask,
         edge_features=edge_features,
         radius=radius,
+        part_interaction_preprocess=part_interaction_preprocess,
+        standardize=standardize,
+        include_self=include_self,
     )
     return torch.cat([star_x, knn_x], dim=1), torch.cat([star_inc, knn_inc], dim=1)
+
+
+def build_star_kin7_plus_knn_graph(
+    x_raw: torch.Tensor,
+    *,
+    radius: float,
+    k: int,
+    mask: torch.Tensor | None = None,
+    seed_min_pt: float = 0.0,
+    part_interaction_preprocess: PartInteractionPreprocess | None = None,
+    standardize_knn: bool = True,
+    include_self: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Canonical star-$R$ hyperedges with **kin7 aggregate** features + ΔR-kNN.
+
+    * **Seeds:** all live particles by default (``seed_min_pt=0``). Set
+      ``seed_min_pt>0`` to optionally drop soft centers.
+    * **Support:** ΔR ball of radius ``radius`` (plus the seed).
+    * **Star feature:** ParT kin7 of the support 4-vector **sum** vs the jet.
+    * **kNN:** part-interaction (4), zero-padded to 7 for a shared edge encoder.
+
+    Layout: ``[star (N) | knn (N·k)]``, edge feature dim = 7.
+    """
+    from cpen.apps.jets.part_kin import (
+        N_PART_KIN_FEATURES,
+        build_part_kin_features_against_jet,
+    )
+
+    if mask is None:
+        mask = particle_mask_from_four_vectors(x_raw)
+    mask = mask.bool()
+
+    batch, n_particles, _ = x_raw.shape
+    device = x_raw.device
+    dtype = x_raw.dtype
+    n_ef = int(N_PART_KIN_FEATURES)
+
+    eta, phi = eta_phi_from_four_vectors_torch(x_raw)
+    pt = torch.hypot(x_raw[..., 1], x_raw[..., 2])
+    seed_ok = mask & (pt > float(seed_min_pt))
+
+    eta1, phi1 = eta.unsqueeze(-1), phi.unsqueeze(-1)
+    eta2, phi2 = eta.unsqueeze(-2), phi.unsqueeze(-2)
+    dr = delta_r_torch(eta1, phi1, eta2, phi2)
+    pair_valid = mask.unsqueeze(-1) & mask.unsqueeze(-2)
+    within = (dr < float(radius)) & pair_valid
+    eye = torch.eye(n_particles, device=device, dtype=torch.bool).view(
+        1, n_particles, n_particles
+    )
+    support = within | (eye & mask.unsqueeze(-1))
+    # Only pT-hard centers seed a star; soft particles may still be members.
+    support = support & seed_ok.unsqueeze(-1)
+
+    star_inc = support.to(dtype)
+    jet = (x_raw * mask.unsqueeze(-1).to(dtype)).sum(dim=1)  # (B, 4)
+    # Aggregate 4-sum per center; zero for non-seeds.
+    agg = (x_raw.unsqueeze(-3) * support.unsqueeze(-1).to(dtype)).sum(dim=-2)
+    star_x = build_part_kin_features_against_jet(agg, jet, mask=seed_ok)
+    star_x = star_x.to(dtype) * seed_ok.unsqueeze(-1).to(dtype)
+
+    knn_x, knn_inc = build_delta_r_knn_edges(
+        x_raw,
+        k=int(k),
+        mask=mask,
+        edge_features="part-interaction",
+        radius=float(radius),
+        part_interaction_preprocess=part_interaction_preprocess,
+        standardize=standardize_knn,
+        include_self=include_self,
+    )
+    knn_pad = torch.zeros(batch, knn_x.size(1), n_ef, device=device, dtype=dtype)
+    knn_pad[..., : knn_x.size(-1)] = knn_x.to(dtype)
+
+    return torch.cat([star_x, knn_pad], dim=1), torch.cat(
+        [star_inc, knn_inc.to(dtype)], dim=1
+    )
 
 
 def build_star_radius_graph_single(

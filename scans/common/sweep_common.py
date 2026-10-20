@@ -8,6 +8,9 @@ lost in a restore). This module loads that bytecode and wraps:
 * ``add_common_args`` / ``configure_graph_args`` for ``--knn-min-pt``, which
   rewrites ``--graph-construction 8-NN`` into ``8-NN@pt1`` (etc.)
 * defaults ``--heavy-metrics-frac`` to ``0`` (ROC AUC / bg rejection every val)
+* defaults ``--n-test`` to ``0`` and skips post-fit ``trainer.test()`` (val metrics
+  already logged during fit; pass ``--n-test N`` with N>0 only when a real test
+  pass is wanted)
 * optional ``--val-check-interval`` / ``--checkpoint-every-n-steps`` / ``--max-steps`` passed through to Lightning
 * ``build_model`` forwards ``--dropout`` into CPEN MLP residuals
 * stream obvious-star mask re-partition (``--stream-mask-seed``)
@@ -178,6 +181,8 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
         n_last = int(getattr(args, "train_last_blocks", 0) or 0)
         if n_last > 0:
             tags.append(f"lastblock{n_last}")
+        if bool(getattr(args, "freeze_backbone", False)):
+            tags.append("freezebb")
     if toptagging_live_active(args):
         tags.append("live")
         edge_features = str(
@@ -196,8 +201,23 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
         live_knn = getattr(args, "live_knn_k", None)
         if live_knn is not None and int(live_knn) > 0:
             tags.append(f"knn{int(live_knn)}")
+            if bool(getattr(args, "live_knn_include_self", False)):
+                tags.append("knnselt")
+            else:
+                tags.append("noloop")
         if bool(getattr(args, "no_star_hyperedges", False)):
             tags.append("nostar")
+        # Canonical star+kNN uses kin7 aggregates (sk7).
+        if bool(getattr(args, "live_star_kin7", True)) and not bool(
+            getattr(args, "no_star_hyperedges", False)
+        ):
+            if getattr(args, "star_radius", None) is not None and getattr(
+                args, "live_knn_k", None
+            ):
+                tags.append("sk7")
+                pt_cut = float(getattr(args, "star_seed_min_pt", 0.0) or 0.0)
+                if pt_cut > 0:
+                    tags.append(f"pt{str(pt_cut).replace('.', 'p')}")
         max_steps = getattr(args, "max_steps", None)
         if max_steps:
             tags.append(f"s{_format_count(int(max_steps))}")
@@ -296,8 +316,22 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
         live_knn = getattr(args, "live_knn_k", None)
         if live_knn is not None and int(live_knn) > 0:
             tags.append(f"knn{int(live_knn)}")
+            if bool(getattr(args, "live_knn_include_self", False)):
+                tags.append("knnselt")
+            else:
+                tags.append("noloop")
         if bool(getattr(args, "no_star_hyperedges", False)):
             tags.append("nostar")
+        if bool(getattr(args, "live_star_kin7", True)) and not bool(
+            getattr(args, "no_star_hyperedges", False)
+        ):
+            if getattr(args, "star_radius", None) is not None and getattr(
+                args, "live_knn_k", None
+            ):
+                tags.append("sk7")
+                pt_cut = float(getattr(args, "star_seed_min_pt", 0.0) or 0.0)
+                if pt_cut > 0:
+                    tags.append(f"pt{str(pt_cut).replace('.', 'p')}")
         n_train = getattr(args, "n_train", None)
         tags.append("Dfull" if n_train is None else f"D{_format_count(int(n_train))}")
         skip = int(getattr(args, "train_skip_jets", 0) or 0)
@@ -340,6 +374,15 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
             action.help = (
                 "Compute ROC AUC / bg rejection on this fraction of epochs "
                 "(plus final). <=0 means every validation (default: 0)."
+            )
+        elif getattr(action, "dest", None) == "n_test":
+            # Fast sweeps: no post-fit test by default (see train_one_run skip).
+            action.default = 0
+            action.help = (
+                "Test-set size for the post-fit trainer.test() pass. Default 0 "
+                "skips that pass entirely (val ROC/acc during fit are enough for "
+                "Plot-1/2/3 sweeps). Pass a positive N only when you want a real "
+                "held-out test evaluation."
             )
         elif getattr(action, "dest", None) == "stream_name":
             action.help = (
@@ -451,6 +494,26 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         ),
     )
     parser.add_argument(
+        "--no-estimate-part-interaction-preprocess",
+        dest="estimate_part_interaction_preprocess",
+        action="store_false",
+        help=(
+            "Do not estimate part-interaction (median, 1.35/IQR) from the live "
+            "edge stream; fall back to PART_INTERACTION_PREPROCESS[R] table. "
+            "Default is to estimate every run for the exact k/R graph."
+        ),
+    )
+    parser.add_argument(
+        "--part-interaction-estimate-jets",
+        type=int,
+        default=512,
+        dest="part_interaction_estimate_jets",
+        help=(
+            "Jets used when estimating part-interaction preprocess from the "
+            "train stream (default: 512)."
+        ),
+    )
+    parser.add_argument(
         "--knn-min-pt",
         type=float,
         default=None,
@@ -558,7 +621,19 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         help=(
             "With --jetclass-stream --star-radius: also append directed ΔR-kNN "
             "2-edges (k neighbors per particle) featurized like the star edges. "
+            "Self is excluded by default (see --live-knn-include-self). "
             "Tags run dirs with knn<k>. Default: None (star hyperedges only)."
+        ),
+    )
+    parser.add_argument(
+        "--live-knn-include-self",
+        action="store_true",
+        dest="live_knn_include_self",
+        help=(
+            "Legacy: put each particle in its own ΔR-kNN top-k (ΔR=0). "
+            "Default off — particle self-attention is already in M11; including "
+            "self created floored part-interaction spikes. Tags run dirs with "
+            "'knnselt'."
         ),
     )
     parser.add_argument(
@@ -570,6 +645,33 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
             "(no star-R hyperedges). --star-radius is still required for "
             "part-interaction feature standardization. Tags run dirs with "
             "'nostar'."
+        ),
+    )
+    parser.add_argument(
+        "--live-star-kin7",
+        action="store_true",
+        dest="live_star_kin7",
+        default=True,
+        help=(
+            "Canonical (default on): star hyperedge features = ParT kin7 of the "
+            "support 4-sum vs the jet. kNN stays part-interaction padded to 7. "
+            "Tags sk7. Pass --no-live-star-kin7 only for legacy part-int stars."
+        ),
+    )
+    parser.add_argument(
+        "--no-live-star-kin7",
+        action="store_false",
+        dest="live_star_kin7",
+        help="Legacy: center↔centroid part-interaction star features (not recommended).",
+    )
+    parser.add_argument(
+        "--star-seed-min-pt",
+        type=float,
+        default=0.0,
+        help=(
+            "Only centers with pT above this (GeV) seed a star hyperedge. "
+            "Default 0 = all live particles (canonical). Soft members always "
+            "allowed. Tags pt{value} when >0."
         ),
     )
     parser.add_argument(
@@ -715,7 +817,18 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         dest="train_last_blocks",
         help=(
             "After --init-from, freeze encoder + early blocks and train only "
-            "the last N CPEN blocks plus readout. 0 (default) = full fine-tune."
+            "the last N CPEN blocks plus readout. 0 (default) = full fine-tune "
+            "(unless --freeze-backbone)."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        dest="freeze_backbone",
+        help=(
+            "After --init-from, freeze the full pretrained trunk and train only "
+            "the (freshly initialized) attentional readout / decoder head. "
+            "Mutually exclusive with --train-last-blocks > 0."
         ),
     )
     parser.add_argument(
@@ -1061,11 +1174,11 @@ def jetclass_live_graph_kwargs(args) -> dict:  # type: ignore[no-untyped-def]
         # Particle transformer: no live star graph.
         return {}
     radius = getattr(args, "star_radius", None)
+    live_knn = getattr(args, "live_knn_k", None)
+    no_star = bool(getattr(args, "no_star_hyperedges", False))
     if radius is None:
         flag = "--jetclass-stream" if jc else "--toptagging-live"
         raise ValueError(f"{flag} requires --star-radius for live graphs")
-    live_knn = getattr(args, "live_knn_k", None)
-    no_star = bool(getattr(args, "no_star_hyperedges", False))
     if no_star and (live_knn is None or int(live_knn) <= 0):
         raise ValueError("--no-star-hyperedges requires --live-knn-k > 0")
     out = {
@@ -1076,9 +1189,20 @@ def jetclass_live_graph_kwargs(args) -> dict:  # type: ignore[no-untyped-def]
         ),
         "live_centroid_weight": getattr(args, "jetclass_centroid_weight", None),
         "live_no_star_hyperedges": no_star,
+        # Canonical star features = kin7 aggregates (unless nostar).
+        "live_star_kin7": (not no_star) and bool(getattr(args, "live_star_kin7", True)),
+        "live_star_seed_min_pt": float(getattr(args, "star_seed_min_pt", 0.0) or 0.0),
     }
     if live_knn is not None and int(live_knn) > 0:
         out["live_graph_k"] = int(live_knn)
+        out["live_knn_include_self"] = bool(
+            getattr(args, "live_knn_include_self", False)
+        )
+    pip = getattr(args, "part_interaction_preprocess", None)
+    if pip is not None:
+        out["live_part_interaction_preprocess"] = tuple(
+            (float(a), float(b)) for a, b in pip
+        )
     return out
 
 
@@ -1103,6 +1227,9 @@ def create_jetclass_datamodule(args, *, data_root):  # type: ignore[no-untyped-d
             shuffle_seed=int(getattr(args, "seed", 0) or 0),
             sort_by_pt=bool(getattr(args, "jetclass_sort_by_pt", False)),
             train_skip_jets=int(getattr(args, "train_skip_jets", 0) or 0),
+            # Size stream chunks for the eventual DDP world even during γ-estimate
+            # setup (trainer not attached yet → world_size=1 otherwise).
+            expected_world_size=max(1, int(getattr(args, "n_gpus", 1) or 1)),
         )
     # Bytecode train_one_run reads dm.corr_adam / corr_sgd into LitCPEN.corr
     # *after* dm.setup(). Stream/cache DMs must not reset these in setup.
@@ -1141,6 +1268,16 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
     (``SupportAttention``), not MLP dropout. ``capen-llama-att`` and
     ``baseline-transformer`` are built here.
     """
+    # kNN part-int (4) is zero-padded to kin7 (7) for kin7-aggregate hyperedges.
+    if bool(getattr(args, "live_star_kin7", True)) and not bool(
+        getattr(args, "no_star_hyperedges", False)
+    ):
+        if getattr(args, "star_radius", None) is not None and getattr(
+            args, "live_knn_k", None
+        ):
+            n_edge_features = 7
+            args.n_edge_features = 7
+
     if getattr(args, "model", None) == "cpen":
         from cpen.models.cpen import CPEN
 
@@ -1339,12 +1476,14 @@ def _attention_gammas_from_args(args):  # type: ignore[no-untyped-def]
         return existing
     values = tuple(getattr(args, name, None) for name in ("gamma_11", "gamma_12", "gamma_21", "gamma_22"))
     if all(v is not None for v in values):
-        return AttentionGammas(
+        gammas = AttentionGammas(
             gamma_11=float(values[0]),
             gamma_12=float(values[1]),
             gamma_21=float(values[2]),
             gamma_22=float(values[3]),
         )
+        gammas, _ = _clamp_all_to_all_gammas(args, gammas)
+        return gammas
     data_root = getattr(args, "data_root", None) or getattr(args, "root", None)
     gammas = resolve_attention_gammas(args, data_root)
     if gammas is None:
@@ -1364,9 +1503,37 @@ def _apply_attention_gammas_to_args(args, gammas) -> None:  # type: ignore[no-un
     args.attention_gammas = gammas
 
 
+def _clamp_all_to_all_gammas(args, gammas):  # type: ignore[no-untyped-def]
+    """Degree-γ is for sparse incidence; force 1 on all-to-all relations.
+
+    Measured row-degrees for dense ``M11`` / hyperedge ``M22`` are ≈ #tokens and
+    would uniformize softmax if used as temperatures. Keep ``γ12`` / ``γ21``
+    (incidence ``S`` / ``Sᵀ``).
+    """
+    from cpen.models.capen import AttentionGammas
+
+    g11 = float(gammas.gamma_11)
+    g12 = float(gammas.gamma_12)
+    g21 = float(gammas.gamma_21)
+    g22 = float(gammas.gamma_22)
+    notes: list[str] = []
+    if _attention_all_to_all_m11(args):
+        if abs(g11 - 1.0) > 1e-12:
+            notes.append(f"γ11 {g11:.4f}→1 (all-to-all M11)")
+        g11 = 1.0
+    hyperedge_m22 = str(getattr(args, "model", "") or "") == _CAPEN_LLAMA_ATT and not bool(
+        getattr(args, "all_edge_m22", False)
+    )
+    if hyperedge_m22:
+        if abs(g22 - 1.0) > 1e-12:
+            notes.append(f"γ22 {g22:.4f}→1 (hyperedge all-to-all M22)")
+        g22 = 1.0
+    return AttentionGammas(gamma_11=g11, gamma_12=g12, gamma_21=g21, gamma_22=g22), notes
+
+
 def _log_attention_gammas(gammas, summaries, *, extra: str = "") -> None:  # type: ignore[no-untyped-def]
     print(
-        "[attn-gamma] mean support row degrees: "
+        "[attn-gamma] effective temperatures: "
         f"gamma_11={gammas.gamma_11:.4f} "
         f"gamma_12={gammas.gamma_12:.4f} "
         f"gamma_21={gammas.gamma_21:.4f} "
@@ -1403,12 +1570,14 @@ def resolve_attention_gammas(args, data_root):  # type: ignore[no-untyped-def]
     if getattr(args, "gamma_estimated", False) and getattr(args, "gamma_11", None) is not None:
         from cpen.models.capen import AttentionGammas
 
-        return AttentionGammas(
+        gammas = AttentionGammas(
             gamma_11=float(args.gamma_11),
             gamma_12=float(args.gamma_12),
             gamma_21=float(args.gamma_21),
             gamma_22=float(args.gamma_22),
         )
+        gammas, _ = _clamp_all_to_all_gammas(args, gammas)
+        return gammas
     estimate = bool(getattr(args, "estimate_gamma_rs", True))
     if not estimate:
         return _orig_resolve_attention_gammas(args, data_root=data_root)
@@ -1433,7 +1602,8 @@ def resolve_attention_gammas(args, data_root):  # type: ignore[no-untyped-def]
     extra = (
         f"n_jets={n_jets} all_to_all_M11={all_to_all} "
         f"hyperedge_M22={hyperedge_m22} drop_pairwise={drop_pairwise} "
-        f"m11_only={m11_only} source=train-batches"
+        f"m11_only={m11_only} star_kin7={bool(live.get('live_star_kin7', True))} "
+        f"source=train-batches"
     )
     factory = _datamodule_factory_ctx.get()
     if factory is None:
@@ -1452,6 +1622,17 @@ def resolve_attention_gammas(args, data_root):  # type: ignore[no-untyped-def]
             live_star_radius=float(live_star) if live_star is not None else None,
             live_graph_k=int(live_k) if live_k is not None else None,
             live_no_star_hyperedges=live_no_star,
+            live_knn_include_self=bool(live.get("live_knn_include_self", False)),
+            live_star_kin7=bool(
+                live.get("live_star_kin7", getattr(args, "live_star_kin7", True))
+            ),
+            live_star_seed_min_pt=float(
+                live.get(
+                    "live_star_seed_min_pt",
+                    getattr(args, "star_seed_min_pt", 0.0),
+                )
+                or 0.0
+            ),
             live_edge_features=str(
                 live.get("live_edge_features")
                 or getattr(args, "jetclass_edge_features", "part-interaction")
@@ -1475,9 +1656,174 @@ def resolve_attention_gammas(args, data_root):  # type: ignore[no-untyped-def]
         args.gamma_estimated = False
         return _orig_resolve_attention_gammas(args, data_root=data_root)
 
+    gammas, clamp_notes = _clamp_all_to_all_gammas(args, gammas)
     _apply_attention_gammas_to_args(args, gammas)
+    if clamp_notes:
+        print("[attn-gamma] " + "; ".join(clamp_notes), flush=True)
     _log_attention_gammas(gammas, summaries, extra=extra)
     return gammas
+
+
+def resolve_part_interaction_preprocess(args, data_root):  # type: ignore[no-untyped-def]
+    """Estimate part-interaction Θ(1) constants from the live train edge stream.
+
+    Attention γ_{rs} is already estimated per-run from support degrees. Feature
+    standardization must match the **same** graph construction (k, R, star+kNN
+    vs star-only); a static radius table is not that. Writes
+    ``args.part_interaction_preprocess`` for :func:`jetclass_live_graph_kwargs`.
+    """
+    del data_root  # estimation uses the train datamodule factory, not data_root
+    edge_feat = str(
+        getattr(args, "jetclass_edge_features", "part-interaction") or "part-interaction"
+    )
+    if edge_feat != "part-interaction":
+        return None
+    if str(getattr(args, "model", "") or "") == _BASELINE_TRANSFORMER:
+        return None
+    if getattr(args, "part_interaction_preprocess", None) is not None and bool(
+        getattr(args, "part_interaction_preprocess_estimated", False)
+    ):
+        return getattr(args, "part_interaction_preprocess")
+
+    estimate = bool(getattr(args, "estimate_part_interaction_preprocess", True))
+    radius = getattr(args, "star_radius", None)
+    live_k = getattr(args, "live_knn_k", None) or getattr(args, "live_graph_k", None)
+    no_star = bool(getattr(args, "no_star_hyperedges", False))
+    # Kin7-aggregate hyperedges are already affine; only kNN needs part-int Θ(1).
+    if bool(getattr(args, "live_star_kin7", True)) and not bool(
+        getattr(args, "no_star_hyperedges", False)
+    ):
+        # Star feats are kin7 (already affine); only kNN needs part-int Θ(1).
+        no_star = True
+    centroid_weight = getattr(args, "jetclass_centroid_weight", None)
+
+    if not estimate:
+        from cpen.graphs.graph_star import part_interaction_preprocess as table_lookup
+
+        if radius is None:
+            raise ValueError(
+                "--no-estimate-part-interaction-preprocess requires --star-radius "
+                "for the PART_INTERACTION_PREPROCESS table"
+            )
+        consts = table_lookup(float(radius))
+        args.part_interaction_preprocess = consts
+        args.part_interaction_preprocess_estimated = False
+        print(
+            f"[part-int] using table preprocess for R={float(radius):g}: {consts}",
+            flush=True,
+        )
+        return consts
+
+    factory = _datamodule_factory_ctx.get()
+    if factory is None:
+        raise RuntimeError(
+            "part-interaction preprocess estimation needs the train datamodule; "
+            "pass constants via args.part_interaction_preprocess or "
+            "--no-estimate-part-interaction-preprocess"
+        )
+
+    from cpen.graphs.graph_star import (
+        build_delta_r_knn_edges,
+        build_star_plus_knn_graph,
+        build_star_radius_graph,
+        robust_part_interaction_preprocess,
+    )
+    import torch
+    from torch.utils.data import DataLoader
+
+    n_jets = int(getattr(args, "part_interaction_estimate_jets", 512) or 512)
+    print(
+        f"[part-int] estimating median/1.35·IQR from first train batches  "
+        f"n_jets={n_jets} R={radius} k={live_k} no_star={no_star}",
+        flush=True,
+    )
+    dm = factory()
+    dm.setup("fit")
+    train = getattr(dm, "_train", None)
+    if train is None:
+        raise RuntimeError("datamodule.setup('fit') did not populate the train split")
+
+    bs = max(1, min(int(getattr(dm, "batch_size", 32) or 32), n_jets))
+    loader_kwargs: dict = {
+        "batch_size": bs,
+        "num_workers": 0,
+        "shuffle": False,
+        "pin_memory": False,
+    }
+    collate_fn = getattr(train, "collate_samples", None)
+    if collate_fn is not None:
+        loader_kwargs["collate_fn"] = collate_fn
+    loader = DataLoader(train, **loader_kwargs)
+
+    chunks: list = []
+    n_seen = 0
+    for batch in loader:
+        if n_seen >= n_jets:
+            break
+        if not isinstance(batch, dict):
+            raise TypeError(f"expected dict batch, got {type(batch)!r}")
+        x_raw = batch.get("x_raw")
+        if x_raw is None:
+            raise ValueError("part-interaction estimate needs x_raw in the batch")
+        mask = batch.get("node_mask", batch.get("mask"))
+        take = min(int(x_raw.size(0)), n_jets - n_seen)
+        x_raw = x_raw[:take]
+        if mask is not None:
+            mask = mask[:take]
+        include_self = bool(getattr(args, "live_knn_include_self", False))
+        if no_star and live_k is not None:
+            edge_x, _ = build_delta_r_knn_edges(
+                x_raw,
+                k=int(live_k),
+                mask=mask,
+                edge_features="part-interaction",
+                radius=float(radius or 0.2),
+                standardize=False,
+                include_self=include_self,
+            )
+        elif radius is not None and live_k is not None:
+            edge_x, _ = build_star_plus_knn_graph(
+                x_raw,
+                radius=float(radius),
+                k=int(live_k),
+                mask=mask,
+                edge_features="part-interaction",
+                centroid_weight=centroid_weight,
+                standardize=False,
+                include_self=include_self,
+            )
+        elif radius is not None:
+            edge_x, _, _ = build_star_radius_graph(
+                x_raw,
+                radius=float(radius),
+                mask=mask,
+                edge_features="part-interaction",
+                centroid_weight=centroid_weight,
+                standardize=False,
+            )
+        else:
+            raise ValueError(
+                "live part-interaction estimate needs --star-radius and/or --live-knn-k"
+            )
+        live_e = edge_x.abs().sum(dim=-1) > 0
+        if live_e.any():
+            chunks.append(edge_x[live_e].detach().float().cpu())
+        n_seen += take
+
+    if not chunks:
+        raise RuntimeError(
+            "no live edges found while estimating part-interaction preprocess"
+        )
+    raw = torch.cat(chunks, dim=0)
+    consts = robust_part_interaction_preprocess(raw)
+    args.part_interaction_preprocess = consts
+    args.part_interaction_preprocess_estimated = True
+    print(
+        f"[part-int] estimated from {int(raw.size(0)):,} live edges  "
+        f"(sub,mul)={consts}",
+        flush=True,
+    )
+    return consts
 
 
 def _resolve_checkpoint_settings(args) -> tuple[str, str]:  # type: ignore[no-untyped-def]
@@ -1556,10 +1902,17 @@ def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
 
     from cpen.training.init_from import (
         assert_ft_root_not_pretrain,
+        freeze_backbone_train_readout,
         freeze_except_last_blocks,
         load_init_checkpoint,
         read_ckpt_global_step,
     )
+
+    # Keep CLI ``args.eta0`` in sync with the per-run sweep value. Bytecode dumps
+    # ``vars(args)`` (default eta0=0.3) alongside Lit ``eta_0``; without this the
+    # two disagree and look like the wrong LR was used.
+    if kwargs.get("eta_0") is not None:
+        args.eta0 = float(kwargs["eta_0"])
 
     seed = int(getattr(args, "seed", 0) or 0)
     L.seed_everything(seed, workers=True)
@@ -1600,6 +1953,20 @@ def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
     ):
         data_root = getattr(args, "data_root", None) or getattr(args, "root", None)
         resolve_attention_gammas(args, data_root)
+    # Part-interaction Θ(1) constants must match the live k/R graph (not a
+    # static radius table). Estimate once per run, like attention γ.
+    if (
+        str(getattr(args, "model", "") or "") != _BASELINE_TRANSFORMER
+        and (jetclass_stream_active(args) or toptagging_live_active(args))
+        and str(
+            getattr(args, "jetclass_edge_features", "part-interaction")
+            or "part-interaction"
+        )
+        == "part-interaction"
+        and getattr(args, "part_interaction_preprocess", None) is None
+    ):
+        data_root = getattr(args, "data_root", None) or getattr(args, "root", None)
+        resolve_part_interaction_preprocess(args, data_root)
     # Bytecode train_one_run only forwards live_graph_k / live_dense_pairs, so
     # live star-R settings have to ride in on the lit_factory.
     live_kwargs = jetclass_live_graph_kwargs(args)
@@ -1639,19 +2006,81 @@ def train_one_run(*, args, **kwargs):  # type: ignore[no-untyped-def]
     if init_from and "lit_factory" in kwargs:
         inner = kwargs["lit_factory"]
         n_last = int(getattr(args, "train_last_blocks", 0) or 0)
+        freeze_backbone = bool(getattr(args, "freeze_backbone", False))
+        if freeze_backbone and n_last > 0:
+            raise ValueError(
+                "--freeze-backbone is mutually exclusive with --train-last-blocks > 0"
+            )
 
         def lit_factory_init(*factory_args, **factory_kwargs):
             lit = inner(*factory_args, **factory_kwargs)
             load_init_checkpoint(lit, init_from, skip_readout=True)
-            if n_last > 0:
+            if freeze_backbone:
+                freeze_backbone_train_readout(lit.model)
+            elif n_last > 0:
                 freeze_except_last_blocks(lit.model, n_blocks=n_last)
             return lit
 
         kwargs["lit_factory"] = lit_factory_init
 
+    # Bytecode always calls trainer.test() after fit. For fast sweeps the val
+    # metrics logged during fit are enough — skip the reload+test pass unless
+    # the user asked for a real test set (--n-test > 0).
+    raw_n_test = getattr(args, "n_test", 0)
+    try:
+        n_test = 0 if raw_n_test is None else int(raw_n_test)
+    except (TypeError, ValueError):
+        n_test = 0
+    skip_postfit_test = n_test <= 0
+    orig_trainer_test = L.Trainer.test if skip_postfit_test else None
+    if skip_postfit_test:
+
+        def _skip_postfit_test(self, *test_args, **test_kwargs):  # noqa: ANN001
+            print(
+                "[train] skipping post-fit trainer.test() "
+                "(--n-test<=0; val metrics already logged during fit)",
+                flush=True,
+            )
+            return []
+
+        L.Trainer.test = _skip_postfit_test  # type: ignore[method-assign]
+
+    # t_epoch / AdamW WD must use the *prescribed* dataset size D = args.n_train
+    # (e.g. 100M JetClass), never the physical subset available on disk. Bytecode
+    # train_one_run feeds probe_split_sizes()["n_train"] into
+    # λ = √width · B / (t_epoch · η₀ · n_train); override the probe for that path.
+    dm = kwargs.get("datamodule")
+    prescribed_n_train = getattr(args, "n_train", None)
+    orig_probe = None
+    orig_split = None
+    if (
+        dm is not None
+        and prescribed_n_train is not None
+        and int(prescribed_n_train) > 0
+        and callable(getattr(dm, "probe_split_sizes", None))
+    ):
+        prescribed_n = int(prescribed_n_train)
+        orig_probe = dm.probe_split_sizes
+
+        def _probe_with_prescribed_n_train() -> dict:
+            sizes = dict(orig_probe())
+            sizes["n_train"] = prescribed_n
+            return sizes
+
+        dm.probe_split_sizes = _probe_with_prescribed_n_train  # type: ignore[method-assign]
+        if callable(getattr(dm, "split_sizes", None)):
+            orig_split = dm.split_sizes
+            dm.split_sizes = _probe_with_prescribed_n_train  # type: ignore[method-assign]
+
     try:
         return _orig_train_one_run(args=args, **kwargs)
     finally:
+        if orig_probe is not None and dm is not None:
+            dm.probe_split_sizes = orig_probe  # type: ignore[method-assign]
+        if orig_split is not None and dm is not None:
+            dm.split_sizes = orig_split  # type: ignore[method-assign]
+        if orig_trainer_test is not None:
+            L.Trainer.test = orig_trainer_test  # type: ignore[method-assign]
         _val_check_interval_ctx.reset(token_vci)
         _checkpoint_monitor_ctx.reset(token_mon)
         _checkpoint_mode_ctx.reset(token_mode)
@@ -1695,6 +2124,10 @@ try:
     _registry.build_model = build_model
     _registry.CPEN = _CPEN
     _registry.CAPEN = _CAPEN
+    # Bytecode compute_weight_decay → weight_decay_for_run; keep the live registry
+    # implementation (t_epoch → λ = λ₀√D) even if the pyc bound an older stub.
+    _bc.weight_decay_for_run = _registry.weight_decay_for_run
+    globals()["weight_decay_for_run"] = _registry.weight_decay_for_run
 except Exception:
     pass
 

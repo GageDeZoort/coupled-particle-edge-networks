@@ -14,23 +14,12 @@ optional identity edge–edge path:
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import torch
 from torch import nn
 
-_PYC = Path(__file__).resolve().with_name("capen.pyc")
-if not _PYC.is_file():
-    raise ImportError(f"Missing bytecode backend {_PYC}")
+from cpen.models._bytecode_loader import load_backend
 
-_spec = importlib.util.spec_from_file_location("cpen.models._capen_bc", _PYC)
-if _spec is None or _spec.loader is None:
-    raise ImportError(f"Could not load {_PYC}")
-_bc = importlib.util.module_from_spec(_spec)
-sys.modules.setdefault("cpen.models._capen_bc", _bc)
-_spec.loader.exec_module(_bc)
+_bc = load_backend(pyc_name="capen.pyc", module_key="cpen.models._capen_bc")
 
 for _name, _value in vars(_bc).items():
     if _name.startswith("__"):

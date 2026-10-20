@@ -1,0 +1,27 @@
+{
+  "updated": "2026-10-07 10:17:21 ET",
+  "ensure": "restart_failed:ssh: connect to host 193.122.155.21 port 22: Connection timed out\n",
+  "toptag_ft": {
+    "job_id": "15046383",
+    "slurm_state": "unknown",
+    "node": "",
+    "elapsed": "",
+    "status": "done",
+    "step": 5000,
+    "max_steps": 5000,
+    "best_roc": 0.984358549118042,
+    "last_val_roc": 0.984358549118042,
+    "init_from": "/scratch/gpfs/BHANIN/jdezoort/cpen_runs/toptagging_finetune/init_ckpts/hxfer-upool-D512-eta0p1-v2stream-last.ckpt",
+    "run_tag": "ft-L4D512-upool-hxfer0p1-gputest-b128-g4-s5000-k6-R0p1",
+    "recipe": "D=512 \u03b7\u2080=0.1 upool \u2192 TopTag live k=6 R=0.1 \u00b7 B=128\u00d74 \u00b7 5k \u00b7 gpu-test",
+    "log": "/scratch/gpfs/BHANIN/jdezoort/cpen_runs/toptagging_finetune/logs/tt_ft_15046383.out"
+  },
+  "attn": {
+    "cells": [],
+    "error": "ssh: connect to host 193.122.155.21 port 22: Connection timed out\n"
+  },
+  "uniform": {
+    "cells": [],
+    "error": "ssh: connect to host 193.122.155.21 port 22: Connection timed out\n"
+  }
+}

@@ -61,13 +61,62 @@ def test_writeup_pooling_geometry() -> None:
     model = make_model()
     pool = model.output_pool
     d = int(model.D)
-    assert pool.attn_x.heads == 1
-    assert pool.attn_e.heads == 1
-    assert pool.attn_x._logit_scale == pytest.approx(1.0 / d)
+    h = int(model.heads)
+    d_h = d // h
+    assert pool.attn_x.heads == h
+    assert pool.attn_e.heads == h
+    assert pool.attn_x.head_combine == "concat"
+    assert pool.attn_x.out_dim == d  # feature pool, not class scores
+    assert pool.attn_x.wo.out_features == d
+    assert pool.attn_x._logit_scale == pytest.approx(1.0 / d_h)
     assert pool.attn_x._proj_scale == pytest.approx(d**-0.5)
+    assert pool.attn_x._out_scale == pytest.approx(d**-0.5)  # α_A=1 feature WO
     assert pool.class_unembed.shape == (2, d)
     assert pool._fuse_scale == pytest.approx(0.5**0.5)
-    assert pool._readout_scale == pytest.approx(d**-0.5)
+    assert pool._readout_scale == pytest.approx(d**-0.5)  # 1/(Dσ) head
+
+
+def test_readout_scale_keeps_feature_updates_width_flat() -> None:
+    """Logits shrink ~1/√D; ΔW under Adam η=η₀/√D stays O(1) (CompleteP head)."""
+    import math
+
+    from cpen.models.base import adam_lr
+    from cpen.models.output_attention_pool import OutputAttentionPool
+
+    eta_0 = 0.1
+    torch.manual_seed(0)
+    delta_norms = []
+    logit_stds = []
+    for width, heads in ((128, 4), (256, 8), (512, 16)):
+        pool = OutputAttentionPool(width, n_classes=2, heads=heads)
+        h_x = torch.randn(4, 16, width)
+        h_x = (h_x - h_x.mean(-1, keepdim=True)) / h_x.std(-1, keepdim=True).clamp_min(1e-5)
+        h_e = torch.randn(4, 8, width)
+        h_e = (h_e - h_e.mean(-1, keepdim=True)) / h_e.std(-1, keepdim=True).clamp_min(1e-5)
+        mask = torch.ones(4, 16, dtype=torch.bool)
+        edge_mask = torch.ones(4, 8, dtype=torch.bool)
+        for p in pool.parameters():
+            p.requires_grad_(True)
+        opt = torch.optim.Adam(
+            pool.parameters(),
+            lr=adam_lr(eta_0, width),
+            eps=1e-14,
+        )
+        logits = pool(h_x, h_e, mask=mask, edge_mask=edge_mask)
+        logit_stds.append(float(logits.detach().std()))
+        target = torch.zeros_like(logits)
+        loss = (logits - target).pow(2).mean()
+        p0 = pool.class_unembed.detach().clone()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        delta = (pool.class_unembed.detach() - p0).norm().item()
+        delta_norms.append(delta)
+
+    ratio_logits = logit_stds[-1] / logit_stds[0]
+    expect_logits = math.sqrt(128 / 512)
+    assert ratio_logits == pytest.approx(expect_logits, rel=0.5)
+    assert max(delta_norms) / min(delta_norms) < 3.0
 
 
 def test_independent_pools_are_not_joint_softmax() -> None:
@@ -417,12 +466,23 @@ def test_default_att_is_not_m11_only() -> None:
 
 
 def test_baseline_pool_skips_fuse_scale() -> None:
-    pool = make_baseline().output_pool
-    d = 16
+    model = make_baseline()
+    pool = model.output_pool
+    d = int(model.D)
+    h = int(model.heads)
+    d_h = d // h
     assert pool.node_only is True
-    assert pool.attn_x.heads == 1
-    assert pool.attn_x._logit_scale == pytest.approx(1.0 / d)
+    assert pool.attn_x.heads == h
+    assert pool.attn_x.head_combine == "concat"
+    assert pool.attn_x._logit_scale == pytest.approx(1.0 / d_h)
+    assert pool.attn_x._out_scale == pytest.approx(d**-0.5)
+    assert pool.attn_x.out_dim == d
     assert pool._readout_scale == pytest.approx(d**-0.5)
+    # Single attn branch → residual scale 1/L (no √2).
+    assert model._attn_residual_scale == pytest.approx(1.0 / float(model.depth))
+    assert make_model()._attn_residual_scale == pytest.approx(
+        1.0 / (model.depth * (2.0**0.5))
+    )
     torch.manual_seed(0)
     h_x = torch.randn(2, 5, d)
     mask = torch.ones(2, 5, dtype=torch.bool)
