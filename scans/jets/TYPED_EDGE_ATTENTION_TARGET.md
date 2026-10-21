@@ -1,7 +1,8 @@
 # Typed edge attention — target semantics
 
-**Status:** §1 implemented in `--typed-edge-streams` (2026-10-20). New runs use
-`run_tag` suffix `-s1`. Do **not** resume archived v1/v2 ckpts.
+**Status:** §1 implemented in `--typed-edge-streams` (2026-10-20). Encoder init
+fixed 2026-10-21 (`σ=D^{-1/2}`); new runs use `run_tag` suffix `-s1i`. Do **not**
+resume archived v1/v2 or bad-init `-s1` ckpts.
 
 Archive (debunked v1/v2 exploration):
 
@@ -10,6 +11,12 @@ Archive (debunked v1/v2 exploration):
   sweep_lr/   # run dirs (v1 + v2 tags)
   logs/       # jc_typed_k7_*.{out,err}
   README.txt
+```
+
+Archive (bad encoder init, `-s1` / `-s1-ailab`):
+
+```
+/scratch/gpfs/BHANIN/jdezoort/cpen_runs/jetclass_scaling_law/archive/typed_edge_s1_bad_init_2026-10-21/
 ```
 
 ---
@@ -81,7 +88,8 @@ Residual scale (locked):
 |---------|---------|
 | v1 (`typed-edge-…` without `-v2`) | Treated **all star slots** as the full-interaction set; zeroed **M12** on knn; gave knn its own knn↔knn M22. |
 | v2 (`…-v2`) | Switched full set to `deg>2` hyperedges (good for M22), but still **zeroed M12 on knn** and kept knn↔knn M22 — **not** the §1 goal. |
-| **s1 (current)** | Matches §1: knn get M12 + `f22=0`; hypers get M12+M22; particles see all edges in M21. |
+| **s1** | Matches §1 routing, but typed encoders used `N(0,1)` (blocker). |
+| **s1i (current)** | §1 + CompleteP encoder init \(σ=D^{-1/2}\); dead `encoder_e` removed. |
 
 ---
 
@@ -91,10 +99,16 @@ Residual scale (locked):
 - [x] Hyper rows (`deg > 2`): apply `f_12` and hyper↔hyper `f_22`.
 - [x] Tiny stars (`deg ≤ 2`): same as knn for routing (`f_12` yes; `f_22 = 0`).
 - [x] `f_21`: **no** type mask — knn and hyperedges both keys/values for particles.
-- [x] Dual encoders + no pad.
-- [x] New `run_tag` suffix `-s1`; do not resume archive ckpts.
+- [x] Dual encoders + no pad (`f22=0` on non-hyper).
+- [x] c08: typed encoder init `std = 1/√D` (was `getattr(init_std, 1.0)`).
+- [x] c09: drop dead `encoder_e`; `corr` groups typed encoders; model skips `γ₂₂`.
+- [x] c10: `init-from` hard-fails typed↔untyped encoder mismatch.
+- [x] c11: tests for init std + per-row residual scale.
+- [x] Stability probe: `--typed-edge-streams` + kin7 star OP graph.
+- [x] New `run_tag` suffix `-s1i`; do not resume `-s1` / archive ckpts.
 - [x] Unit tests: `tests/test_typed_edge_streams.py`.
 - [x] CLI help quotes §1.
+- [ ] c06: star-feature standardization check (still open).
 
 ---
 

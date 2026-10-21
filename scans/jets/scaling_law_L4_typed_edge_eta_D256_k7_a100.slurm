@@ -8,7 +8,7 @@
 #   --typed-edge-streams
 #   η₀ ∈ {0.01, 0.05, 0.1, 0.25, 0.5}
 #   max_steps=40000 (2h slot partial-progresses; resubmit to resume)
-#   run_tag = typed-edge-b256-g1-s40000-dh32-k7-R0p1-s1
+#   run_tag = typed-edge-b256-g1-s40000-dh32-k7-R0p1-s1i
 #
 #   sbatch scans/jets/scaling_law_L4_typed_edge_eta_D256_k7_a100.slurm
 #
@@ -61,7 +61,7 @@ N_TRAIN=$((MAX_STEPS * BATCH * N_GPUS))
 EPOCHS=2
 ROOT=/scratch/gpfs/BHANIN/jdezoort/cpen_runs/jetclass_scaling_law
 R_TAG=$(python3 -c "e=float('${STAR_R}'); print(f'{e:g}'.replace('.','p'))")
-RUN_TAG="typed-edge-b${BATCH}-g${N_GPUS}-s${MAX_STEPS}-dh${D_HEAD}-k${KNN_K}-R${R_TAG}-s1"
+RUN_TAG="typed-edge-b${BATCH}-g${N_GPUS}-s${MAX_STEPS}-dh${D_HEAD}-k${KNN_K}-R${R_TAG}-s1i"
 
 echo "PWD=$(pwd)"
 echo "Host: $(hostname)"

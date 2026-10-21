@@ -94,8 +94,10 @@ class CAPENLlamaAtt(CAPENLlama):
         self._pending_m22_full: torch.Tensor | None = None
         self._attn_residual_scale_single = 1.0 / float(max(int(self.depth), 1))
         if self.typed_edge_streams:
-            sigma = float(getattr(self, "init_std", 1.0) or 1.0)
+            # CompleteP: W ~ N(0, σ²) with σ = D^{-1/2}, same as encoder_x / encoder_e.
+            # Do not use getattr(init_std, 1.0) — that is N(0,1) and breaks width-stable Δρ.
             d = int(self.D)
+            sigma = 1.0 / math.sqrt(d)
             n_s = int(self.n_star_edge_features)
             n_k = int(self.n_knn_edge_features)
             if n_s < 1 or n_k < 1:
@@ -108,6 +110,15 @@ class CAPENLlamaAtt(CAPENLlama):
             nn.init.normal_(self.encoder_e_knn.weight, mean=0.0, std=sigma)
             self._encoder_e_star_scale = math.sqrt(d / float(n_s))
             self._encoder_e_knn_scale = math.sqrt(d / float(n_k))
+            # Drop unused shared encoder so it is not in P / corr groups / DDP.
+            del self.encoder_e
+
+    def _gamma_for(self, relation: str) -> float:
+        # Typed §1 M22 is sparse hyper↔hyper gather/scatter — not dense all-to-all.
+        # Skip γ₂₂ in the model itself (do not rely on sweep_common name-clamp → 1).
+        if relation == "22" and bool(getattr(self, "typed_edge_streams", False)):
+            return 1.0
+        return super()._gamma_for(relation)
 
     def _build_supports(
         self,
@@ -559,8 +570,6 @@ class CAPENLlamaAtt(CAPENLlama):
                 )
                 h_knn = self.encoder_e_knn(edge_x_knn) * self._encoder_e_knn_scale
                 h_e = torch.cat([h_star, h_knn], dim=1)
-                # Keep shared encoder_e in the graph for DDP unused-param guards.
-                h_e = h_e + (self.encoder_e.weight * 0).sum()
             else:
                 h_e = self.encoder_e(edge_x) * self._encoder_e_scale
             self._record_probe("encode", h_x, h_e, node_mask_eff)

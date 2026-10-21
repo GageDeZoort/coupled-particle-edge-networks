@@ -53,11 +53,17 @@ H^{(0)} = W^{(0)} x \cdot \frac{1}{\sigma\sqrt{n_0}}
 | Stream | \(n_0\) (JetClass / paper default) | Forward scale |
 |---|---|---|
 | Particles \(X\) | \(n_0 = n_{\mathrm{features}}\) (kin7 → 7) | \(\sqrt{D/7}\) |
-| Edges \(E\) | \(m_0 = n_{\mathrm{edge\_features}}\) (part-interaction → 4) | \(\sqrt{D/4}\) |
+| Edges \(E\) (shared / untyped) | \(m_0 = n_{\mathrm{edge\_features}}\) (padded part-int → often 7) | \(\sqrt{D/m_0}\) |
+| Star edges (typed) | \(m_0^{\star}=7\) (kin7 aggregate) | \(\sqrt{D/7}\) |
+| kNN edges (typed) | \(m_0^{\mathrm{knn}}=4\) (part-interaction) | \(\sqrt{D/4}\) |
+
+Typed (`--typed-edge-streams`): dual CompleteP encoders `encoder_e_star` /
+`encoder_e_knn` with the same \(W\sim\mathcal N(0,\sigma^2)\) rule; the unused
+shared `encoder_e` is **deleted** so it is not counted in \(P\).
 
 **Do not** initialize encoder weights \(\sim\mathcal N(0,1)\). That makes
 \(\rho\propto D\) and **breaks width-stable output \(\Delta\rho\)** (seen
-2026-10-02).
+2026-10-02; typed-edge regression 2026-10-21 when `init_std` defaulted to 1).
 
 ---
 
@@ -208,8 +214,9 @@ use \(H=1\) in the pool (attention logits would scale as \(1/D\)).
 \quad\text{for all trainable params (Adam / AdamW base LR).}
 \]
 
-Optional `corr` multiplies **only** `encoder_x` / `encoder_e` param-group LRs
-(first-layer correction); it does **not** change `adam_lr` itself.
+Optional `corr` multiplies **only** first-layer encoder param-group LRs
+(`encoder_x`, `encoder_e`, and typed `encoder_e_star` / `encoder_e_knn`);
+it does **not** change `adam_lr` itself.
 
 AdamW weight decay (when used): \(\lambda = \lambda_0\sqrt{D}\) so
 \(\lambda\eta\) is width-invariant.
@@ -259,5 +266,6 @@ is equivalent to \(U\sim\mathcal N(0,1)\) with multiplier \(1/D\).
 
 | Date | Note |
 |---|---|
+| 2026-10-21 | Typed dual encoders: same \(N(0,\sigma^2)\) with \(\sigma=D^{-1/2}\) (not `init_std=1`); drop dead shared `encoder_e`; `corr` covers `encoder_e_{star,knn}`; typed skips \(\gamma_{22}\) in-model. |
 | 2026-10-07 | Pool: multi-head concat \(\frac{1}{D\sigma}\sum_h W_{O,h}v_h\) (match trunk \(H\)); skip \(\gamma\) on all-to-all \(M_{11}/M_{22}\); keep \(\gamma_{12,21}\). BaselineTransformer residual \(1/L\) (no \(\sqrt{2}\)). |
 | 2026-10-02 | File created after encoder \(N(0,1)\) bug broke uniform output \(\Delta\rho\). Encoder confirmed as \(N(0,\sigma^2)\) × \(1/(\sigma\sqrt{n_0})\). |

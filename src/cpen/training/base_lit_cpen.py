@@ -567,12 +567,21 @@ class BaseLitCPEN(L.LightningModule):
 
     @staticmethod
     def _is_embedding_param(name: str) -> bool:
-        """True for ``encoder_x`` / ``encoder_e`` weights (not readout / blocks)."""
-        return any(part in {"encoder_x", "encoder_e"} for part in name.split("."))
+        """True for first-layer encoders (not readout / blocks)."""
+        return any(
+            part
+            in {
+                "encoder_x",
+                "encoder_e",
+                "encoder_e_star",
+                "encoder_e_knn",
+            }
+            for part in name.split(".")
+        )
 
     def configure_optimizers(self):
         # Base width-wise LR: η₀/√D for every layer. ``corr`` scales only the
-        # embedding encoders (encoder_x, encoder_e) — never readout / trunk.
+        # embedding encoders (encoder_x / encoder_e / typed) — never readout / trunk.
         # When corr==1, keep a single param group so resumes match checkpoints
         # written before embedding-LR splits existed.
         base_lr = self.model.get_lr(eta_0=self.eta_0, corr=1.0)
@@ -593,7 +602,7 @@ class BaseLitCPEN(L.LightningModule):
         split = abs(float(self.corr) - 1.0) > 1e-12
         if split and not embed_params:
             raise ValueError(
-                f"corr={self.corr:g} but no encoder_x/encoder_e parameters found; "
+                f"corr={self.corr:g} but no encoder_* parameters found; "
                 "refusing to silently apply a global LR multiplier"
             )
         if split:

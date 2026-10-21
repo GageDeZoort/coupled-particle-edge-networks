@@ -55,7 +55,7 @@ N_TRAIN=$((MAX_STEPS * BATCH * N_GPUS))
 EPOCHS=2
 ROOT=/scratch/gpfs/BHANIN/jdezoort/cpen_runs/jetclass_scaling_law
 R_TAG=$(python3 -c "e=float('${STAR_R}'); print(f'{e:g}'.replace('.','p'))")
-RUN_TAG="typed-edge-b${BATCH}-g${N_GPUS}-s${MAX_STEPS}-dh${D_HEAD}-k${KNN_K}-R${R_TAG}-s1-ailab"
+RUN_TAG="typed-edge-b${BATCH}-g${N_GPUS}-s${MAX_STEPS}-dh${D_HEAD}-k${KNN_K}-R${R_TAG}-s1i-ailab"
 
 echo "PWD=$(pwd)"
 echo "Host: $(hostname)"

@@ -35,7 +35,7 @@ N_GPUS=4
 D_HEAD=32
 KNN_K=7
 R_TAG=0p1
-RUN_TAG="typed-edge-b${BATCH}-g${N_GPUS}-s${MAX_STEPS}-dh${D_HEAD}-k${KNN_K}-R${R_TAG}-s1"
+RUN_TAG="typed-edge-b${BATCH}-g${N_GPUS}-s${MAX_STEPS}-dh${D_HEAD}-k${KNN_K}-R${R_TAG}-s1i"
 
 cell_meta() {
   local task=$1

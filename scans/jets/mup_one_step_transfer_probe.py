@@ -39,6 +39,7 @@ if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))
 
 from cpen.graphs.graph_star import (  # noqa: E402
+    build_star_kin7_plus_knn_graph,
     build_star_plus_knn_graph,
     robust_part_interaction_preprocess,
 )
@@ -138,7 +139,22 @@ def _estimate_preprocess(
     *,
     k: int,
     radius: float,
+    typed: bool = False,
 ) -> tuple[tuple[float, float], ...]:
+    if typed:
+        _star, knn_x, _inc = build_star_kin7_plus_knn_graph(
+            x_raw.cpu(),
+            radius=float(radius),
+            k=int(k),
+            mask=mask.cpu(),
+            typed_features=True,
+            standardize_knn=False,
+            include_self=False,
+        )
+        live = knn_x.abs().sum(dim=-1) > 0
+        if not live.any():
+            raise RuntimeError(f"no live knn edges for k={k} R={radius}")
+        return robust_part_interaction_preprocess(knn_x[live])
     edge_x, _ = build_star_plus_knn_graph(
         x_raw.cpu(),
         radius=float(radius),
@@ -159,7 +175,26 @@ def _materialize_graph(
     k: int,
     radius: float,
     preprocess: tuple[tuple[float, float], ...],
+    typed: bool = False,
 ) -> dict[str, torch.Tensor]:
+    out = dict(batch)
+    if typed:
+        star_x, knn_x, incidence = build_star_kin7_plus_knn_graph(
+            batch["x_raw"],
+            radius=float(radius),
+            k=int(k),
+            mask=batch["mask"],
+            part_interaction_preprocess=preprocess,
+            typed_features=True,
+            include_self=False,
+        )
+        edge_mask = incidence.bool().any(dim=-1)
+        out["edge_x_star"] = star_x
+        out["edge_x_knn"] = knn_x
+        out["edge_x"] = None  # typed forward ignores shared edge_x
+        out["incidence"] = incidence
+        out["edge_mask"] = edge_mask
+        return out
     edge_x, incidence = build_star_plus_knn_graph(
         batch["x_raw"],
         radius=float(radius),
@@ -169,7 +204,6 @@ def _materialize_graph(
         part_interaction_preprocess=preprocess,
     )
     edge_mask = edge_x.abs().sum(dim=-1) > 0
-    out = dict(batch)
     out["edge_x"] = edge_x
     out["incidence"] = incidence
     out["edge_mask"] = edge_mask
@@ -186,6 +220,7 @@ def _build_model(
     heads: int,
     uniform_pool: bool,
     seed: int,
+    typed: bool = False,
 ) -> CAPENLlamaAtt:
     torch.manual_seed(int(seed))
     return CAPENLlamaAtt(
@@ -202,6 +237,10 @@ def _build_model(
         all_to_all_particle_attention=True,
         uniform_output_pool=bool(uniform_pool),
         n_class_tokens=int(out_dim),
+        typed_edge_streams=bool(typed),
+        hyperedge_m22_only=not bool(typed),
+        n_star_edge_features=7,
+        n_knn_edge_features=4,
     )
 
 
@@ -215,6 +254,8 @@ def _forward_kwargs(batch: dict[str, torch.Tensor]) -> dict:
         "rope_coordinates",
         "wire_coordinates",
         "x_raw",
+        "edge_x_star",
+        "edge_x_knn",
     )
     return {k: batch[k] for k in keys if k in batch and batch[k] is not None}
 
@@ -277,7 +318,7 @@ def snapshot_xe(
     try:
         model.eval()
         with torch.no_grad():
-            model(batch["x"], batch["edge_x"], **_forward_kwargs(batch))
+            model(batch["x"], batch.get("edge_x"), **_forward_kwargs(batch))
         snaps = parse_probe(probe, node_mask=node_mask, edge_mask=edge_mask)
     finally:
         disable_probe(model)
@@ -339,18 +380,24 @@ def run_one(
     radius: float,
     seed: int,
     heads: int,
+    typed: bool = False,
 ) -> list[dict]:
     device = batch["x"].device
     out_dim = max(2, int(batch["y"].max().item()) + 1 if batch["y"].numel() else 2)
+    if typed:
+        n_edge_features = 7  # unused after dual encoders; keep for ctor
+    else:
+        n_edge_features = int(batch["edge_x"].size(-1))
     model = _build_model(
         depth=depth,
         width=width,
         n_features=int(batch["x"].size(-1)),
-        n_edge_features=int(batch["edge_x"].size(-1)),
+        n_edge_features=n_edge_features,
         out_dim=out_dim,
         heads=heads,
         uniform_pool=uniform_pool,
         seed=seed,
+        typed=typed,
     ).to(device)
 
     lr = adam_lr(eta_0, width)
@@ -360,7 +407,8 @@ def run_one(
 
     model.train()
     opt.zero_grad(set_to_none=True)
-    logits = model(batch["x"], batch["edge_x"], **_forward_kwargs(batch))
+    edge_x = batch.get("edge_x")
+    logits = model(batch["x"], edge_x, **_forward_kwargs(batch))
     loss = F.cross_entropy(logits, batch["y"])
     loss.backward()
     opt.step()
@@ -378,6 +426,7 @@ def run_one(
         "k": int(k),
         "radius": float(radius),
         "uniform_pool": bool(uniform_pool),
+        "typed_edge_streams": bool(typed),
         "seed": int(seed),
         "batch_id": int(batch.get("_batch_id", 0)),
         "loss_1": float(loss.detach()),
@@ -522,6 +571,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         help="Fix synthetic batch seed across model seeds (vary init only)",
     )
     p.add_argument("--synthetic", action="store_true")
+    p.add_argument(
+        "--typed-edge-streams",
+        action="store_true",
+        help=(
+            "Probe CAPEN-Llama-att typed dual encoders + §1 routing on the "
+            "kin7 star + part-int kNN operating-point graph (no pad)."
+        ),
+    )
     p.add_argument("--pools", type=str, default="attn")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args(list(argv) if argv is not None else None)
@@ -584,10 +641,20 @@ def main(argv: Iterable[str] | None = None) -> int:
         device=device,
         seed=int(args.seed),
     )
+    typed = bool(args.typed_edge_streams)
+    if typed:
+        print(
+            "[probe] typed-edge-streams: kin7 star + part-int kNN, dual encoders, §1 routing",
+            flush=True,
+        )
     preprocess_by_cell: dict[tuple[int, float], tuple] = {}
     for k, radius in cells:
         preprocess_by_cell[(k, radius)] = _estimate_preprocess(
-            ref_raw["x_raw"], ref_raw["mask"], k=k, radius=radius
+            ref_raw["x_raw"],
+            ref_raw["mask"],
+            k=k,
+            radius=radius,
+            typed=typed,
         )
         print(
             f"[probe] k={k} R={radius:g} preprocess={preprocess_by_cell[(k, radius)]}",
@@ -604,7 +671,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     print(
                         f"  L={depth} D={width} H={heads} d_h={width // heads} η₀={eta0:g} "
                         f"pool={'uniform' if uniform else 'attn'} "
-                        f"({n_seeds}×{n_batches}) …",
+                        f"typed={typed} ({n_seeds}×{n_batches}) …",
                         flush=True,
                     )
                     for seed_i in range(n_seeds):
@@ -620,7 +687,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                                 seed=batch_seed,
                             )
                             batch = _materialize_graph(
-                                raw, k=k, radius=radius, preprocess=preprocess
+                                raw,
+                                k=k,
+                                radius=radius,
+                                preprocess=preprocess,
+                                typed=typed,
                             )
                             batch["_batch_id"] = batch_i
                             trial_rows.extend(
@@ -634,6 +705,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                                     radius=radius,
                                     seed=model_seed,
                                     heads=heads,
+                                    typed=typed,
                                 )
                             )
                             del raw, batch

@@ -16,21 +16,21 @@ PATHS = (
     {
         "key": "gputest",
         "label": "Della gputest B=64×4",
-        "run_tag": "typed-edge-b64-g4-s40000-dh32-k7-R0p1-s1",
+        "run_tag": "typed-edge-b64-g4-s40000-dh32-k7-R0p1-s1i",
         "job_name": "jc-typed-k7",
         "log_glob": "jc_typed_k7_s40k_gt_*.out",
     },
     {
         "key": "ailab",
         "label": "ailab qos=gpu-test B=256×1",
-        "run_tag": "typed-edge-b256-g1-s40000-dh32-k7-R0p1-s1-ailab",
+        "run_tag": "typed-edge-b256-g1-s40000-dh32-k7-R0p1-s1i-ailab",
         "job_name": "jc-typed-ailab",
         "log_glob": "jc_typed_k7_ailab_*.out",
     },
     {
         "key": "a100",
         "label": "gpu-short 1×A100 B=256×1",
-        "run_tag": "typed-edge-b256-g1-s40000-dh32-k7-R0p1-s1",
+        "run_tag": "typed-edge-b256-g1-s40000-dh32-k7-R0p1-s1i",
         "job_name": "jc-typed-a100",
         "log_glob": "jc_typed_k7_a100_*.out",
     },
@@ -331,7 +331,7 @@ def main() -> None:
     updated = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     recipe = (
         "L4/D256/H8 · typed-edge §1 (knn:M12; hyper:M12+M22; particles:M11+M21 all edges) · "
-        "k★=7 R★=0.1 noloop · ailab/a100/gputest · target 40k · tag -s1"
+        "k★=7 R★=0.1 noloop · ailab/a100/gputest · target 40k · tag -s1i"
     )
 
     # Callout

@@ -10,7 +10,7 @@
 #   η₀ ∈ {0.01, 0.05, 0.1, 0.25, 0.5}
 #   B_gpu=64 × 4 → B_global=256, Adam, 40k steps
 #   n_train = 40k × 256 = 10.24M unique
-#   run_tag = typed-edge-b64-g4-s40000-dh32-k7-R0p1-s1
+#   run_tag = typed-edge-b64-g4-s40000-dh32-k7-R0p1-s1i
 #
 # Prefer the watchdog:
 #   bash scans/jets/start_typed_edge_eta_D256_k7_gputest_watchdogs.sh
@@ -65,8 +65,8 @@ N_TRAIN=$((MAX_STEPS * BATCH * N_GPUS))
 EPOCHS=1
 ROOT=/scratch/gpfs/BHANIN/jdezoort/cpen_runs/jetclass_scaling_law
 R_TAG=$(python3 -c "e=float('${STAR_R}'); print(f'{e:g}'.replace('.','p'))")
-# -s1: TYPED_EDGE_ATTENTION_TARGET.md §1 routing
-RUN_TAG="typed-edge-b${BATCH}-g${N_GPUS}-s${MAX_STEPS}-dh${D_HEAD}-k${KNN_K}-R${R_TAG}-s1"
+# -s1i: TYPED_EDGE_ATTENTION_TARGET.md §1 + CompleteP encoder init
+RUN_TAG="typed-edge-b${BATCH}-g${N_GPUS}-s${MAX_STEPS}-dh${D_HEAD}-k${KNN_K}-R${R_TAG}-s1i"
 
 echo "PWD=$(pwd)"
 echo "Host: $(hostname)"

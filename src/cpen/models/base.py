@@ -20,8 +20,9 @@ def adam_lr(eta_0: float, width: int, *, corr: float = 1.0) -> float:
     """Adam base LR: ``η₀ / √D``.
 
     ``corr`` is accepted for call-site compatibility but is **not** applied here.
-    Embedding (first-layer) corrections multiply only ``encoder_x`` / ``encoder_e``
-    param groups in :meth:`BaseLitCPEN.configure_optimizers`.
+    Embedding (first-layer) corrections multiply only encoder param groups
+    (``encoder_x`` / ``encoder_e`` / typed ``encoder_e_star`` / ``encoder_e_knn``)
+    in :meth:`BaseLitCPEN.configure_optimizers`.
     """
     del corr  # first-layer only; see BaseLitCPEN.configure_optimizers
     return eta_0 / math.sqrt(width)

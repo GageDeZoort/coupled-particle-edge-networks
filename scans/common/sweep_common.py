@@ -483,7 +483,7 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         default=1.0,
         help=(
             "Embedding LR correction C. Trunk / readout use η₀/√D; "
-            "encoder_x and encoder_e use C·η₀/√D. Default: 1."
+            "encoder_x / encoder_e / typed encoder_e_{star,knn} use C·η₀/√D. Default: 1."
         ),
     )
     parser.add_argument(

@@ -104,6 +104,15 @@ def _cli() -> argparse.Namespace:
     )
     p.add_argument("--tag", default="L4D256-cosine", help="Filename stem tag")
     p.add_argument(
+        "--typed-edge-streams",
+        action="store_true",
+        dest="typed_edge_streams",
+        help=(
+            "Match --typed-edge-streams training: dual encoders + §1 routing "
+            "(scans/jets/TYPED_EDGE_ATTENTION_TARGET.md)."
+        ),
+    )
+    p.add_argument(
         "--synthetic",
         action="store_true",
         help="Skip HDF5; use random jets (unit-test / offline smoke).",
@@ -230,6 +239,7 @@ def _make_args(cli: argparse.Namespace):
         gamma_22=1.0,
         corr=1.0,
         n_edge_features=7,
+        typed_edge_streams=bool(getattr(cli, "typed_edge_streams", False)),
     )
     return args
 
@@ -325,10 +335,18 @@ def main() -> None:
                 all_findings.extend(classify_attention_entry(entry, thresholds=thr))
             feature_rows.extend(classify_feature_probe(feat_probe, thresholds=thr))
             n_done += 1
+            n_edges = int(batch["edge_x"].size(1)) if batch.get("edge_x") is not None else -1
+            if batch.get("edge_x_star") is not None and batch.get("edge_x_knn") is not None:
+                n_edges = int(batch["edge_x_star"].size(1) + batch["edge_x_knn"].size(1))
             print(
                 f"[probe] batch {n_done}/{cli.n_batches}  "
-                f"N={int(batch['x'].size(0))} M={int(batch['edge_x'].size(1))}  "
+                f"N={int(batch['x'].size(0))} M={n_edges}  "
                 f"attn_entries={len(attn_probe)}"
+                + (
+                    " typed"
+                    if bool(getattr(cli, "typed_edge_streams", False))
+                    else ""
+                )
             )
 
     head_rows = findings_to_rows(all_findings)
@@ -374,12 +392,18 @@ def main() -> None:
         "data": data_note,
         "n_batches": n_done,
         "batch_size": cli.batch_size,
-        "graph": {"knn_k": cli.knn_k, "star_r": cli.star_r, "star_kin7": True},
+        "graph": {
+            "knn_k": cli.knn_k,
+            "star_r": cli.star_r,
+            "star_kin7": True,
+            "typed_edge_streams": bool(getattr(cli, "typed_edge_streams", False)),
+        },
         "model": {
             "depth": cli.depth,
             "width": cli.width,
             "heads": cli.heads,
             "out_dim": out_dim,
+            "typed_edge_streams": bool(getattr(cli, "typed_edge_streams", False)),
         },
         "load_state_dict": {
             "n_missing": len(missing),

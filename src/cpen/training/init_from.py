@@ -65,6 +65,20 @@ def load_init_checkpoint(
         raise TypeError(f"Unexpected checkpoint payload type: {type(state)!r}")
 
     current = lit_module.state_dict()
+
+    def _has_typed_edge_encoders(keys) -> bool:
+        return any("encoder_e_star" in k for k in keys)
+
+    src_typed = _has_typed_edge_encoders(state)
+    tgt_typed = _has_typed_edge_encoders(current)
+    if src_typed != tgt_typed:
+        raise RuntimeError(
+            "init-from typed/untyped edge-encoder mismatch "
+            f"(checkpoint_typed={src_typed}, model_typed={tgt_typed}); "
+            "refusing a load that would leave typed encoders at random init "
+            "or drop them silently"
+        )
+
     filtered: dict[str, torch.Tensor] = {}
     skipped_head: list[str] = []
     skipped_shape: list[str] = []
@@ -78,6 +92,19 @@ def load_init_checkpoint(
             skipped_shape.append(k)
             continue
         filtered[k] = v
+
+    if tgt_typed:
+        need_enc = [
+            k
+            for k in current
+            if "encoder_e_star" in k or "encoder_e_knn" in k
+        ]
+        missing_enc = [k for k in need_enc if k not in filtered]
+        if missing_enc:
+            raise RuntimeError(
+                "init-from typed model is missing edge-encoder weights in the "
+                f"checkpoint: {missing_enc[:8]}…"
+            )
 
     missing, unexpected = lit_module.load_state_dict(filtered, strict=False)
     n_cur = len(current)
