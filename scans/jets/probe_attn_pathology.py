@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """Load a pretrained CAPEN-Llama-att ckpt and probe attention-head pathologies.
 
-Default target is the frozen L4/D256 JetClass cosine init used for TopTag FT:
+Default data is **JetClass val** (kin7), not TopTagging / not isotropic synthetic
+jets. Synthetic jets scatter over η–φ and produce mostly single-key hyperedges,
+which trivially trip collapse (max_weight=1, entropy=0).
 
-  /scratch/.../toptagging_finetune/init_ckpts/L4D256-cosine-s781250-frozen.ckpt
-
-Builds live star+kNN graphs (k★=7, R★=0.1, noloop) on a **partial HDF5 slice**
-of TopTagging val (no full-file RAM load), records per-head entropy / max-weight /
-QKV RMS / logit extremes / NaN counts, and writes CSV + JSON summaries.
+Metrics (see ``attn_pathology_metrics``):
+  * entropy / max-weight stratified by support size (k=1, 2, ≥3)
+  * collapse uses multi-key (k≥2) max-weight only
+  * logit pathology uses per-row spread (max−min), not batch |logit| max
+  * self_top_frac on square attentions (M11 / M22)
 
 Examples
 --------
-Login-node smoke::
-
-  python scans/jets/probe_attn_pathology.py --device cpu --n-batches 2 --batch-size 2
-
-GPU node (recommended)::
-
-  python scans/jets/probe_attn_pathology.py --device cuda --n-batches 16 --batch-size 8
+  python scans/jets/probe_attn_pathology.py \\
+    --ckpt .../last.ckpt --typed-edge-streams \\
+    --jetclass-raw-root /projects/j/jdezoort/jetclass \\
+    --n-jets 256 --batch-size 16 --device cuda
 """
 from __future__ import annotations
 
@@ -37,6 +36,7 @@ for path in (REPO_ROOT, REPO_ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+from cpen.apps.jets.jetclass_stream import JetClassSubsetDataset
 from cpen.apps.jets.part_kin import N_PART_KIN_FEATURES
 from cpen.apps.jets.toptagging import (
     MAX_NUM_PARTICLES,
@@ -66,20 +66,49 @@ DEFAULT_CKPT = Path(
     "init_ckpts/L4D256-cosine-s781250-frozen.ckpt"
 )
 DEFAULT_OUT = Path(
-    "/scratch/gpfs/BHANIN/jdezoort/cpen_runs/toptagging_finetune/"
+    "/scratch/gpfs/BHANIN/jdezoort/cpen_runs/jetclass_scaling_law/"
     "attn_pathology"
 )
-DEFAULT_DATA = Path("/scratch/gpfs/BHANIN/jdezoort/datasets/toptagging")
+DEFAULT_JETCLASS = Path("/projects/j/jdezoort/jetclass")
+DEFAULT_TOPTAG = Path("/scratch/gpfs/BHANIN/jdezoort/datasets/toptagging")
 
 
 def _cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ckpt", type=Path, default=DEFAULT_CKPT)
     p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
-    p.add_argument("--data-root", type=Path, default=DEFAULT_DATA)
+    p.add_argument(
+        "--jetclass-raw-root",
+        type=Path,
+        default=DEFAULT_JETCLASS,
+        help="JetClass ROOT root (expects val_5M/). Default for paper probes.",
+    )
+    p.add_argument(
+        "--toptagging-root",
+        type=Path,
+        default=DEFAULT_TOPTAG,
+        help="Only used with --data toptagging (legacy).",
+    )
+    p.add_argument(
+        "--data",
+        choices=("jetclass", "toptagging", "synthetic"),
+        default="jetclass",
+        help="Probe jets source. Prefer jetclass (default).",
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--n-batches", type=int, default=8)
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument(
+        "--n-jets",
+        type=int,
+        default=256,
+        help="Number of validation jets (≥256 recommended).",
+    )
+    p.add_argument(
+        "--n-batches",
+        type=int,
+        default=None,
+        help="Override batch count; default = ceil(n_jets / batch_size).",
+    )
+    p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--depth", type=int, default=4)
     p.add_argument("--width", type=int, default=256)
@@ -90,7 +119,7 @@ def _cli() -> argparse.Namespace:
         "--num-particles",
         type=int,
         default=80,
-        help="Pad/truncate (pretrain/FT use 80; HDF5 stores up to 200).",
+        help="Pad/truncate (JetClass typed pretrain uses 80).",
     )
     p.add_argument(
         "--collapse-max-weight",
@@ -98,9 +127,16 @@ def _cli() -> argparse.Namespace:
         default=DEFAULT_THRESHOLDS.collapse_max_weight,
     )
     p.add_argument(
+        "--logit-spread-max",
+        type=float,
+        default=DEFAULT_THRESHOLDS.logit_spread_max,
+        help="Flag logit_explode when per-row (max−min) spread exceeds this.",
+    )
+    p.add_argument(
         "--logit-abs-max",
         type=float,
         default=DEFAULT_THRESHOLDS.logit_abs_max,
+        help="Legacy; kept for report fields only (does not trip flags).",
     )
     p.add_argument("--tag", default="L4D256-cosine", help="Filename stem tag")
     p.add_argument(
@@ -115,29 +151,51 @@ def _cli() -> argparse.Namespace:
     p.add_argument(
         "--synthetic",
         action="store_true",
-        help="Skip HDF5; use random jets (unit-test / offline smoke).",
+        help="Alias for --data synthetic (offline smoke only; not for paper).",
     )
     return p.parse_args()
 
 
-def _load_val_slice(
+def _load_jetclass_val(
+    data_root: Path,
+    *,
+    n_jets: int,
+    num_particles: int,
+) -> list[dict[str, torch.Tensor]]:
+    """Class-balanced JetClass val subset (kin7) held in RAM."""
+    ds = JetClassSubsetDataset(
+        data_root,
+        "val",
+        n_jets=int(n_jets),
+        num_particles=int(num_particles),
+        feature_config="kin7",
+    )
+    samples: list[dict[str, torch.Tensor]] = []
+    for i in range(len(ds)):
+        item = ds[i]
+        samples.append(
+            {
+                "x": item["x"],
+                "x_raw": item["x_raw"],
+                "mask": item["mask"].to(dtype=torch.bool),
+                "y": item["y"].to(dtype=torch.long),
+            }
+        )
+    return samples
+
+
+def _load_toptag_val_slice(
     data_root: Path,
     *,
     n_jets: int,
     num_particles: int,
     seed: int,
 ) -> list[dict[str, torch.Tensor]]:
-    """Partial-read TopTagging val.h5 (contiguous head + shuffle) via pandas.
-
-    Avoids ``RawTopTaggingSplit``'s full-file RAM load. Uses a contiguous
-    ``start:stop`` window then subsamples — enough for pathology probes.
-    """
+    """Legacy TopTagging val.h5 slice (prefer JetClass for paper probes)."""
     path = raw_hdf5_path(str(data_root), "val")
     if not path.is_file():
         raise FileNotFoundError(path)
     need = int(n_jets)
-    # Read a modest window (4× need, capped) so we can shuffle without scanning
-    # all 403k rows.
     window = min(max(need * 4, need), 4096)
     df = pd.read_hdf(path, key="table", start=0, stop=window)
     data = np.asarray(df)
@@ -164,6 +222,24 @@ def _load_val_slice(
             }
         )
     return samples
+
+
+def _qk_weight_norms(state_dict: dict) -> dict[str, float]:
+    """Frobenius norms of attn W_Q / W_K per relation×layer (from ckpt)."""
+    out: dict[str, float] = {}
+    for rel in ("11", "12", "21", "22"):
+        for kind in ("wq", "wk"):
+            key_prefix = f"model.attn_{rel}."
+            # ModuleList: model.attn_11.0.wq.weight
+            norms = []
+            for k, v in state_dict.items():
+                if f"attn_{rel}." in k and f".{kind}.weight" in k:
+                    norms.append(float(v.detach().float().norm().item()))
+            if norms:
+                out[f"attn_{rel}_{kind}_norm_mean"] = float(np.mean(norms))
+                out[f"attn_{rel}_{kind}_norm_max"] = float(np.max(norms))
+                out[f"attn_{rel}_{kind}_norm_by_layer"] = norms
+    return out
 
 
 def _synthetic_jets(n_jets: int, num_particles: int, seed: int) -> list[dict[str, torch.Tensor]]:
@@ -252,18 +328,34 @@ def main() -> None:
         raise SystemExit(f"checkpoint not found: {ckpt}")
 
     torch.manual_seed(cli.seed)
-    n_jets = int(cli.n_batches) * int(cli.batch_size)
-    if cli.synthetic:
+    data_mode = "synthetic" if cli.synthetic else str(cli.data)
+    n_jets = int(cli.n_jets)
+    if cli.n_batches is not None:
+        n_jets = max(n_jets, int(cli.n_batches) * int(cli.batch_size))
+    if data_mode == "synthetic":
         samples = _synthetic_jets(n_jets, cli.num_particles, cli.seed)
-        data_note = "synthetic"
-    else:
-        samples = _load_val_slice(
-            cli.data_root,
+        data_note = f"synthetic n={len(samples)} (NOT for paper)"
+    elif data_mode == "toptagging":
+        samples = _load_toptag_val_slice(
+            cli.toptagging_root,
             n_jets=n_jets,
             num_particles=cli.num_particles,
             seed=cli.seed,
         )
         data_note = f"toptagging-val-slice n={len(samples)}"
+    else:
+        samples = _load_jetclass_val(
+            cli.jetclass_raw_root,
+            n_jets=n_jets,
+            num_particles=cli.num_particles,
+        )
+        data_note = f"jetclass-val-kin7 n={len(samples)}"
+
+    n_batches = (
+        int(cli.n_batches)
+        if cli.n_batches is not None
+        else max(1, (len(samples) + int(cli.batch_size) - 1) // int(cli.batch_size))
+    )
 
     args = _make_args(cli)
     payload = torch.load(ckpt, map_location="cpu", weights_only=False)
@@ -274,6 +366,7 @@ def main() -> None:
     args.gamma_21 = float(sd["model.attn_gamma_21"])
     args.gamma_22 = float(sd["model.attn_gamma_22"])
     out_dim = int(sd["model.output_pool.class_tokens"].shape[0])
+    qk_norms = _qk_weight_norms(sd)
 
     model = build_model(
         args,
@@ -305,6 +398,7 @@ def main() -> None:
 
     thr = PathologyThresholds(
         collapse_max_weight=float(cli.collapse_max_weight),
+        logit_spread_max=float(cli.logit_spread_max),
         logit_abs_max=float(cli.logit_abs_max),
     )
 
@@ -313,7 +407,7 @@ def main() -> None:
     n_done = 0
     with torch.no_grad():
         for start in range(0, len(samples), cli.batch_size):
-            if n_done >= cli.n_batches:
+            if n_done >= n_batches:
                 break
             batch = _collate(samples[start : start + cli.batch_size])
             batch = {
@@ -339,7 +433,7 @@ def main() -> None:
             if batch.get("edge_x_star") is not None and batch.get("edge_x_knn") is not None:
                 n_edges = int(batch["edge_x_star"].size(1) + batch["edge_x_knn"].size(1))
             print(
-                f"[probe] batch {n_done}/{cli.n_batches}  "
+                f"[probe] batch {n_done}/{n_batches}  "
                 f"N={int(batch['x'].size(0))} M={n_edges}  "
                 f"attn_entries={len(attn_probe)}"
                 + (
@@ -379,10 +473,40 @@ def main() -> None:
 
     out_dir = cli.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"attn_pathology_{cli.tag}_b{cli.n_batches}"
+    stem = f"attn_pathology_{cli.tag}_n{len(samples)}"
     csv_path = out_dir / f"{stem}.csv"
     json_path = out_dir / f"{stem}.json"
     agg.to_csv(csv_path, index=False)
+
+    # Relation-level rollup of stratified metrics (mean over heads×batches).
+    rel_rollup: dict[str, dict[str, float]] = {}
+    if not df.empty:
+        for rel, g in df.groupby("relation"):
+            rel_rollup[str(rel)] = {
+                "frac_rows_k1": float(g["frac_rows_k1"].mean())
+                if "frac_rows_k1" in g
+                else float("nan"),
+                "frac_rows_kge3": float(g["frac_rows_kge3"].mean())
+                if "frac_rows_kge3" in g
+                else float("nan"),
+                "entropy_multikey": float(g["entropy_multikey"].mean())
+                if "entropy_multikey" in g
+                else float("nan"),
+                "max_weight_multikey": float(g["max_weight_multikey"].mean())
+                if "max_weight_multikey" in g
+                else float("nan"),
+                "logit_spread_max_multikey": float(g["logit_spread_max_multikey"].mean())
+                if "logit_spread_max_multikey" in g
+                else float("nan"),
+                "self_top_frac": float(g["self_top_frac"].mean())
+                if "self_top_frac" in g
+                else float("nan"),
+                "self_top_frac_multikey": float(g["self_top_frac_multikey"].mean())
+                if "self_top_frac_multikey" in g
+                else float("nan"),
+                "q_rms": float(g["q_rms"].mean()) if "q_rms" in g else float("nan"),
+                "k_rms": float(g["k_rms"].mean()) if "k_rms" in g else float("nan"),
+            }
 
     report = {
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -390,6 +514,7 @@ def main() -> None:
         "global_step": step,
         "device": str(device),
         "data": data_note,
+        "n_jets": len(samples),
         "n_batches": n_done,
         "batch_size": cli.batch_size,
         "graph": {
@@ -415,6 +540,7 @@ def main() -> None:
             "collapse_max_weight": thr.collapse_max_weight,
             "uniform_entropy": thr.uniform_entropy,
             "dead_rms": thr.dead_rms,
+            "logit_spread_max": thr.logit_spread_max,
             "logit_abs_max": thr.logit_abs_max,
             "row_mass_err": thr.row_mass_err,
         },
@@ -424,6 +550,8 @@ def main() -> None:
             "21": args.gamma_21,
             "22": args.gamma_22,
         },
+        "qk_weight_norms": qk_norms,
+        "relation_rollup": rel_rollup,
         "summary": summary,
         "feature_probe_flagged": feat_flagged[:32],
         "csv": str(csv_path),

@@ -490,16 +490,14 @@ class CAPEN(nn.Module):
                     logits = logits / temp
                 supp = support.bool()
                 weights = module._attention_weights(logits, supp)
-                stats = attention_diversity_stats(weights, supp)
-                if stats is not None:
-                    probe.update(stats)
-                # Mean support size over nonempty target rows.
-                row_deg = supp.sum(dim=-1).to(dtype=torch.float32)
-                nonempty = supp.any(dim=-1)
-                if nonempty.any():
-                    probe["support_size"] = float(row_deg[nonempty].mean().item())
-                else:
-                    probe["support_size"] = 0.0
+                # Support-size stratified entropy / max-weight / logit spread /
+                # self-top (see attn_pathology_metrics; drop k=1 from collapse).
+                from cpen.training.attn_pathology_metrics import (
+                    compute_attention_probe_metrics,
+                )
+
+                rich = compute_attention_probe_metrics(weights, supp, logits)
+                probe.update(rich)
 
                 # Per-head pathology proxies (H,).
                 def _rms_heads(t: torch.Tensor) -> torch.Tensor:
@@ -517,13 +515,10 @@ class CAPEN(nn.Module):
 
                 supp_h = supp.unsqueeze(1)  # (B,1,T,S)
                 logits_f = logits.float()
-                # Mask unsupported entries when reporting logit extremes.
-                neg = torch.finfo(torch.float32).min
-                logits_m = logits_f.masked_fill(~supp_h, neg)
-                # (B,H,T) → mean over nonempty → (H,)
-                nonempty_h = nonempty.unsqueeze(1).expand_as(logits_m[..., 0])
-                abs_logits = logits_m.abs()
-                abs_logits = abs_logits.masked_fill(~supp_h, 0.0)
+                nonempty = supp.any(dim=-1)
+                nonempty_h = nonempty.unsqueeze(1).expand(
+                    -1, module.heads, -1
+                )
 
                 def _mean_over_rows(x_bht: torch.Tensor) -> torch.Tensor:
                     out_h = []
@@ -534,7 +529,7 @@ class CAPEN(nn.Module):
                         )
                     return torch.stack(out_h)
 
-                probe["logit_abs_max"] = abs_logits.amax(dim=(0, 2, 3))
+                abs_logits = logits_f.abs().masked_fill(~supp_h, 0.0)
                 probe["logit_abs_mean"] = _mean_over_rows(
                     abs_logits.sum(dim=-1)
                     / supp_h.to(abs_logits.dtype).sum(dim=-1).clamp_min(1.0)

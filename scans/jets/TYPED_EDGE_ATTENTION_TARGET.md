@@ -109,6 +109,14 @@ Residual scale (locked):
 - [x] Unit tests: `tests/test_typed_edge_streams.py`.
 - [x] CLI help quotes §1.
 - [ ] c06: star-feature standardization check (still open).
+- [x] c13: pathology probe fixes — JetClass val (≥256), support-size
+      stratified entropy/max-weight, collapse excludes k=1 rows, logit
+      **spread** (not |logit| max), self-top fraction, Q/K weight norms.
+- [ ] c14: remeasure -s1i at ~2k / 10k / final × η₀∈{0.05,0.25,0.5} ×
+      D=256 + largest width (blocked until those ckpts exist / step saves).
+- [ ] q03: γ₂₁ ∈ {mean deg, √(mean deg), 1} at one size (entropy + val loss).
+- [ ] q04: bound logits only if real spread growth rises with η₀.
+- [ ] q05: typed default vs f₂₂=0 on all edges at matched budget.
 
 ---
 

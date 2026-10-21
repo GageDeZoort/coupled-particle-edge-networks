@@ -3,7 +3,12 @@
 Enable ``model._attention_probe = []`` (and optionally ``_feature_probe``),
 run a forward, then classify each ``(layer, relation, head)`` for numerical
 pathologies: NaN/Inf, softmax collapse / near-uniform mass, dead QKV, logit
-explosions, and broken row mass.
+spread explosions, and broken row mass.
+
+Collapse uses **multi-key** (support ≥ 2) max-weight only — single-key rows
+are trivial (weight 1, entropy 0) and must not trip the flag. Logit pathology
+uses per-row **spread** (max−min on supported keys), not a batch-global
+``|logit|`` max (softmax is shift-invariant).
 """
 
 from __future__ import annotations
@@ -23,10 +28,15 @@ class PathologyThresholds:
     uniform_entropy: float = 0.98
     uniform_min_support: float = 2.5
     dead_rms: float = 1e-6
+    # Per-row logit spread (max−min on supported keys), not |logit| abs max.
+    logit_spread_max: float = 40.0
+    # Legacy absolute threshold kept for reporting only (not used for flags).
     logit_abs_max: float = 40.0
     row_mass_err: float = 1e-3
     feature_rms_hi: float = 50.0
     feature_rms_lo: float = 1e-6
+    # Require this many multi-key rows before collapse can fire.
+    collapse_min_multikey_rows: float = 1.0
 
 
 DEFAULT_THRESHOLDS = PathologyThresholds()
@@ -56,6 +66,38 @@ def _as_float_list(value: Any, *, n_heads: int) -> list[float]:
     raise TypeError(f"unsupported probe value type: {type(value)!r}")
 
 
+_HEAD_METRIC_KEYS = (
+    "entropy",
+    "eff_width",
+    "max_weight",
+    "entropy_multikey",
+    "max_weight_multikey",
+    "entropy_k1",
+    "entropy_k2",
+    "entropy_kge3",
+    "max_weight_k1",
+    "max_weight_k2",
+    "max_weight_kge3",
+    "logit_spread_mean",
+    "logit_spread_max",
+    "logit_spread_mean_multikey",
+    "logit_spread_max_multikey",
+    "logit_abs_max",
+    "logit_abs_mean",
+    "self_top_frac",
+    "self_top_frac_multikey",
+    "q_rms",
+    "k_rms",
+    "v_rms",
+    "ctx_rms",
+    "n_nan_logits",
+    "n_inf_logits",
+    "n_nan_weights",
+    "row_mass_err_max",
+    "row_mass_err_mean",
+)
+
+
 def classify_attention_entry(
     entry: dict[str, Any],
     *,
@@ -71,26 +113,13 @@ def classify_attention_entry(
         raise TypeError("probe entry missing tensor entropy")
 
     metrics = {
-        "entropy": _as_float_list(entry.get("entropy"), n_heads=n_heads),
-        "eff_width": _as_float_list(entry.get("eff_width"), n_heads=n_heads),
-        "max_weight": _as_float_list(entry.get("max_weight"), n_heads=n_heads),
-        "q_rms": _as_float_list(entry.get("q_rms"), n_heads=n_heads),
-        "k_rms": _as_float_list(entry.get("k_rms"), n_heads=n_heads),
-        "v_rms": _as_float_list(entry.get("v_rms"), n_heads=n_heads),
-        "ctx_rms": _as_float_list(entry.get("ctx_rms"), n_heads=n_heads),
-        "logit_abs_max": _as_float_list(entry.get("logit_abs_max"), n_heads=n_heads),
-        "logit_abs_mean": _as_float_list(entry.get("logit_abs_mean"), n_heads=n_heads),
-        "n_nan_logits": _as_float_list(entry.get("n_nan_logits"), n_heads=n_heads),
-        "n_inf_logits": _as_float_list(entry.get("n_inf_logits"), n_heads=n_heads),
-        "n_nan_weights": _as_float_list(entry.get("n_nan_weights"), n_heads=n_heads),
-        "row_mass_err_max": _as_float_list(
-            entry.get("row_mass_err_max"), n_heads=n_heads
-        ),
-        "row_mass_err_mean": _as_float_list(
-            entry.get("row_mass_err_mean"), n_heads=n_heads
-        ),
+        key: _as_float_list(entry.get(key), n_heads=n_heads) for key in _HEAD_METRIC_KEYS
     }
     support_size = float(entry.get("support_size", float("nan")))
+    n_rows_multikey = float(entry.get("n_rows_multikey", float("nan")))
+    frac_k1 = float(entry.get("frac_rows_k1", float("nan")))
+    frac_k2 = float(entry.get("frac_rows_k2", float("nan")))
+    frac_kge3 = float(entry.get("frac_rows_kge3", float("nan")))
     n_nan_out = float(entry.get("n_nan_out", 0.0) or 0.0)
     n_inf_out = float(entry.get("n_inf_out", 0.0) or 0.0)
     layer = int(entry.get("layer", -1))
@@ -102,6 +131,10 @@ def classify_attention_entry(
         flags: list[str] = []
         row = {k: metrics[k][h] for k in metrics}
         row["support_size"] = support_size
+        row["n_rows_multikey"] = n_rows_multikey
+        row["frac_rows_k1"] = frac_k1
+        row["frac_rows_k2"] = frac_k2
+        row["frac_rows_kge3"] = frac_kge3
         row["n_nan_out"] = n_nan_out
         row["n_inf_out"] = n_inf_out
 
@@ -115,13 +148,23 @@ def classify_attention_entry(
             flags.append("nan_out")
         if n_inf_out > 0:
             flags.append("inf_out")
-        if row["max_weight"] >= thr.collapse_max_weight:
-            flags.append("collapse")
+
+        # Collapse: multi-key rows only (k≥2). Skip if no multi-key mass.
+        mw_mk = row["max_weight_multikey"]
         if (
-            row["entropy"] >= thr.uniform_entropy
-            and support_size >= thr.uniform_min_support
+            n_rows_multikey >= thr.collapse_min_multikey_rows
+            and mw_mk == mw_mk  # not NaN
+            and mw_mk >= thr.collapse_max_weight
         ):
+            flags.append("collapse")
+
+        # Near-uniform: prefer multi-key entropy when available.
+        ent_u = row["entropy_multikey"]
+        if ent_u != ent_u:
+            ent_u = row["entropy"]
+        if ent_u >= thr.uniform_entropy and support_size >= thr.uniform_min_support:
             flags.append("near_uniform")
+
         if row["q_rms"] < thr.dead_rms:
             flags.append("dead_q")
         if row["k_rms"] < thr.dead_rms:
@@ -130,15 +173,23 @@ def classify_attention_entry(
             flags.append("dead_v")
         if row["ctx_rms"] < thr.dead_rms:
             flags.append("dead_ctx")
-        if row["logit_abs_max"] >= thr.logit_abs_max:
+
+        # Logit explode: per-row spread (multi-key preferred).
+        spread = row["logit_spread_max_multikey"]
+        if spread != spread:
+            spread = row["logit_spread_max"]
+        if spread == spread and spread >= thr.logit_spread_max:
             flags.append("logit_explode")
+
         if row["row_mass_err_max"] > thr.row_mass_err:
             flags.append("row_mass_bad")
-        # Non-finite metric values themselves.
+        # self_top_* is NaN on bipartite relations (T≠S) by design — not a fault.
         for key, val in row.items():
-            if key.startswith("n_"):
+            if key.startswith("n_") or key.startswith("frac_") or key.startswith(
+                "self_top"
+            ):
                 continue
-            if val != val or val in (float("inf"), float("-inf")):  # NaN/Inf
+            if val != val or val in (float("inf"), float("-inf")):
                 flags.append(f"nonfinite_{key}")
 
         findings.append(
@@ -168,7 +219,9 @@ def classify_feature_probe(
         he = h_e.detach().float()
         if mask is not None:
             w = mask.to(dtype=hx.dtype).unsqueeze(-1)
-            rms_x = float(((hx.pow(2) * w).sum() / w.sum().clamp_min(1.0) / hx.size(-1)).sqrt())
+            rms_x = float(
+                ((hx.pow(2) * w).sum() / w.sum().clamp_min(1.0) / hx.size(-1)).sqrt()
+            )
         else:
             rms_x = float(hx.pow(2).mean().sqrt())
         rms_e = float(he.pow(2).mean().sqrt())
@@ -229,9 +282,15 @@ def summarize_findings(findings: Sequence[HeadFinding]) -> dict[str, Any]:
                 "head": f.head,
                 "flags": f.flags,
                 "max_weight": f.metrics.get("max_weight"),
+                "max_weight_multikey": f.metrics.get("max_weight_multikey"),
                 "entropy": f.metrics.get("entropy"),
-                "logit_abs_max": f.metrics.get("logit_abs_max"),
+                "entropy_multikey": f.metrics.get("entropy_multikey"),
+                "logit_spread_max": f.metrics.get("logit_spread_max"),
+                "logit_spread_max_multikey": f.metrics.get("logit_spread_max_multikey"),
+                "self_top_frac": f.metrics.get("self_top_frac"),
+                "frac_rows_k1": f.metrics.get("frac_rows_k1"),
                 "q_rms": f.metrics.get("q_rms"),
+                "k_rms": f.metrics.get("k_rms"),
             }
             for f in worst[:16]
             if f.flags
