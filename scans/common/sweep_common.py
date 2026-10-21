@@ -252,6 +252,8 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
         tags.append("incm22")
     if bool(getattr(args, "all_edge_m22", False)):
         tags.append("fullm22")
+    if bool(getattr(args, "typed_edge_streams", False)):
+        tags.append("typed")
     if bool(getattr(args, "uniform_output_pool", False)):
         tags.append("unipool")
     if bool(getattr(args, "hyperedge_only", False)):
@@ -872,6 +874,18 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         ),
     )
     parser.add_argument(
+        "--typed-edge-streams",
+        action="store_true",
+        dest="typed_edge_streams",
+        help=(
+            "CAPEN-Llama-att: dual edge encoders (star kin7 √(D/7), kNN "
+            "part-int √(D/4), no pad). §1 routing: particles M11+M21 from all "
+            "edges; hyperedges (deg>2) M12+M22; non-hyper edges M12 only "
+            "(f22=0, no LN self-copy). See "
+            "scans/jets/TYPED_EDGE_ATTENTION_TARGET.md. Tags run dirs with typed."
+        ),
+    )
+    parser.add_argument(
         "--uniform-output-pool",
         action="store_true",
         dest="uniform_output_pool",
@@ -1198,6 +1212,8 @@ def jetclass_live_graph_kwargs(args) -> dict:  # type: ignore[no-untyped-def]
         out["live_knn_include_self"] = bool(
             getattr(args, "live_knn_include_self", False)
         )
+    if bool(getattr(args, "typed_edge_streams", False)):
+        out["live_typed_edge_streams"] = True
     pip = getattr(args, "part_interaction_preprocess", None)
     if pip is not None:
         out["live_part_interaction_preprocess"] = tuple(
@@ -1321,6 +1337,10 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
             raise ValueError(
                 "--all-edge-m22 cannot combine with --identity-m22 or --incidence-m22"
             )
+        if bool(getattr(args, "typed_edge_streams", False)) and bool(
+            getattr(args, "all_edge_m22", False)
+        ):
+            raise ValueError("--typed-edge-streams cannot combine with --all-edge-m22")
         attention_gammas = _attention_gammas_from_args(args)
         dataset = getattr(args, "dataset", "toptagging")
         readout_mode = getattr(args, "readout_mode", "graph")
@@ -1329,6 +1349,9 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
             BaselineTransformer
             if str(args.model) == _BASELINE_TRANSFORMER
             else CAPENLlamaAtt
+        )
+        typed = cls is CAPENLlamaAtt and bool(
+            getattr(args, "typed_edge_streams", False)
         )
         model = cls(
             n_features=n_features,
@@ -1356,13 +1379,18 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
             identity_m22=bool(getattr(args, "identity_m22", False)),
             incidence_m22=bool(getattr(args, "incidence_m22", False)),
             hyperedge_m22_only=(
-                cls is CAPENLlamaAtt and not bool(getattr(args, "all_edge_m22", False))
+                cls is CAPENLlamaAtt
+                and not bool(getattr(args, "all_edge_m22", False))
+                and not typed
             ),
             ignore_knn_edges=bool(getattr(args, "hyperedge_only", False)),
             n_class_tokens=int(out_dim),
             uniform_output_pool=bool(getattr(args, "uniform_output_pool", False)),
             use_rope=bool(getattr(args, "use_rope", False)),
             rope_theta=float(getattr(args, "rope_theta", 100.0) or 100.0),
+            typed_edge_streams=typed,
+            n_star_edge_features=7,
+            n_knn_edge_features=4,
         )
         return model
     # capen / capen-llama / particle-only: original factory (attention dropout only for CAPEN*).

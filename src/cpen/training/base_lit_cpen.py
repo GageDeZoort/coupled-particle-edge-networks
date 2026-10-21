@@ -134,6 +134,7 @@ class BaseLitCPEN(L.LightningModule):
         live_edge_features: str = "part-interaction",
         live_centroid_weight: str | None = None,
         live_no_star_hyperedges: bool = False,
+        live_typed_edge_streams: bool = False,
         live_knn_include_self: bool = False,
         live_part_interaction_preprocess: tuple[tuple[float, float], ...] | None = None,
         live_star_kin7: bool = True,
@@ -173,9 +174,11 @@ class BaseLitCPEN(L.LightningModule):
         self.live_part_interaction_preprocess = live_part_interaction_preprocess
         self.live_star_kin7 = bool(live_star_kin7)
         self.live_star_seed_min_pt = float(live_star_seed_min_pt)
+        self.live_typed_edge_streams = bool(live_typed_edge_streams)
         # live_star_radius + live_graph_k ⇒ canonical star-R (kin7) ∥ ΔR-kNN.
         # live_no_star_hyperedges + live_graph_k ⇒ ΔR-kNN 2-edges only.
         # live_knn_include_self=False (default) ⇒ true neighbors only (no self spike).
+        # live_typed_edge_streams ⇒ unpadded star(7)+knn(4) for dual encoders.
 
         self._build_task_metrics(int(model.out_dim))
 
@@ -304,17 +307,38 @@ class BaseLitCPEN(L.LightningModule):
                 # Canonical: star-R kin7 aggregates ∥ ΔR-kNN part-interaction.
                 from cpen.graphs.graph_star import build_star_kin7_plus_knn_graph
 
-                edge_x, incidence = build_star_kin7_plus_knn_graph(
-                    x_raw,
-                    radius=float(self.live_star_radius),
-                    k=int(self.live_graph_k),
-                    mask=mask,
-                    seed_min_pt=float(self.live_star_seed_min_pt),
-                    part_interaction_preprocess=self.live_part_interaction_preprocess,
-                    include_self=self.live_knn_include_self,
-                )
-                batch["edge_x"] = edge_x
-                batch["incidence"] = incidence
+                if self.live_typed_edge_streams:
+                    star_x, knn_x, incidence = build_star_kin7_plus_knn_graph(
+                        x_raw,
+                        radius=float(self.live_star_radius),
+                        k=int(self.live_graph_k),
+                        mask=mask,
+                        seed_min_pt=float(self.live_star_seed_min_pt),
+                        part_interaction_preprocess=self.live_part_interaction_preprocess,
+                        include_self=self.live_knn_include_self,
+                        typed_features=True,
+                    )
+                    batch["edge_x_star"] = star_x
+                    batch["edge_x_knn"] = knn_x
+                    batch["incidence"] = incidence
+                    # Placeholder so code that reads edge_x.size(1) sees M=Ns+Nk.
+                    batch["edge_x"] = star_x.new_zeros(
+                        star_x.size(0),
+                        star_x.size(1) + knn_x.size(1),
+                        1,
+                    )
+                else:
+                    edge_x, incidence = build_star_kin7_plus_knn_graph(
+                        x_raw,
+                        radius=float(self.live_star_radius),
+                        k=int(self.live_graph_k),
+                        mask=mask,
+                        seed_min_pt=float(self.live_star_seed_min_pt),
+                        part_interaction_preprocess=self.live_part_interaction_preprocess,
+                        include_self=self.live_knn_include_self,
+                    )
+                    batch["edge_x"] = edge_x
+                    batch["incidence"] = incidence
             elif self.live_star_radius is not None:
                 from cpen.graphs.graph_star import build_star_radius_graph
 
@@ -411,6 +435,10 @@ class BaseLitCPEN(L.LightningModule):
                 kwargs["edge_mask"] = batch["edge_mask"]
             if batch.get("node_mask") is not None:
                 kwargs["node_mask"] = batch["node_mask"]
+            if batch.get("edge_x_star") is not None:
+                kwargs["edge_x_star"] = batch["edge_x_star"]
+            if batch.get("edge_x_knn") is not None:
+                kwargs["edge_x_knn"] = batch["edge_x_knn"]
             return kwargs
 
         if isinstance(model, ParticleOnlyNetwork) and "adjacency" in model.operator_names:

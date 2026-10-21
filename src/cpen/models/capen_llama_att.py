@@ -15,6 +15,12 @@ CAPEN-Llama behaviour.
   over padded edge slots (critical for hierarchical caches with ``M∼10³``).
   ``--hyperedge-only`` (``ignore_knn_edges``) additionally drops those pairwise
   rows from the edge stream before ``M_{12}/M_{21}``.
+* **Typed edge streams** (``typed_edge_streams``) — dual CompleteP encoders
+  (star kin7 → √(D/7), kNN part-int → √(D/4), no pad). Routing (§1 in
+  ``scans/jets/TYPED_EDGE_ATTENTION_TARGET.md``): particles get M11+M21 from
+  **all** edges; hyperedges (``deg>2``) get M12+M22; non-hyper edges (kNN +
+  tiny stars) get M12 only with ``f_22=0`` (no LN self-copy, no knn↔knn).
+  Edge residual: hyper ``1/(√2 L)``, non-hyper ``1/L``.
 * **RoPE** — ``--use-rope`` applies axial :math:`(\\eta,\\phi)` rotary embeddings
   on relation 11 only (jet-centered :math:`(\\Delta\\eta,\\Delta\\phi)` from
   four-vectors). Mutually exclusive with ``--use-wire``.
@@ -24,6 +30,8 @@ CAPEN-Llama behaviour.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 from torch import nn
@@ -44,6 +52,9 @@ class CAPENLlamaAtt(CAPENLlama):
         ignore_knn_edges: bool = False,
         m11_only: bool = False,
         uniform_output_pool: bool = False,
+        typed_edge_streams: bool = False,
+        n_star_edge_features: int = 7,
+        n_knn_edge_features: int = 4,
         **kwargs,
     ):  # type: ignore[no-untyped-def]
         super().__init__(*args, **kwargs)
@@ -54,10 +65,15 @@ class CAPENLlamaAtt(CAPENLlama):
         self.ignore_knn_edges = bool(ignore_knn_edges)
         self.m11_only = bool(m11_only)
         self.uniform_output_pool = bool(uniform_output_pool)
+        self.typed_edge_streams = bool(typed_edge_streams)
+        self.n_star_edge_features = int(n_star_edge_features)
+        self.n_knn_edge_features = int(n_knn_edge_features)
         if self.m11_only and bool(getattr(self, "use_wire", False)):
             raise ValueError(
                 "m11_only / BaselineTransformer cannot use WIRE (needs a graph Laplacian)"
             )
+        if self.typed_edge_streams and self.m11_only:
+            raise ValueError("typed_edge_streams is incompatible with m11_only")
         if self.uniform_output_pool:
             self.output_pool = None
         else:
@@ -73,6 +89,25 @@ class CAPENLlamaAtt(CAPENLlama):
         self._pending_edge_type: torch.Tensor | None = None
         self._pending_edge_mask: torch.Tensor | None = None
         self._pending_is_hyper: torch.Tensor | None = None
+        self._pending_is_star: torch.Tensor | None = None
+        self._pending_is_knn: torch.Tensor | None = None
+        self._pending_m22_full: torch.Tensor | None = None
+        self._attn_residual_scale_single = 1.0 / float(max(int(self.depth), 1))
+        if self.typed_edge_streams:
+            sigma = float(getattr(self, "init_std", 1.0) or 1.0)
+            d = int(self.D)
+            n_s = int(self.n_star_edge_features)
+            n_k = int(self.n_knn_edge_features)
+            if n_s < 1 or n_k < 1:
+                raise ValueError(
+                    f"typed edge fan-ins must be >=1; got star={n_s} knn={n_k}"
+                )
+            self.encoder_e_star = nn.Linear(n_s, d, bias=False)
+            self.encoder_e_knn = nn.Linear(n_k, d, bias=False)
+            nn.init.normal_(self.encoder_e_star.weight, mean=0.0, std=sigma)
+            nn.init.normal_(self.encoder_e_knn.weight, mean=0.0, std=sigma)
+            self._encoder_e_star_scale = math.sqrt(d / float(n_s))
+            self._encoder_e_knn_scale = math.sqrt(d / float(n_k))
 
     def _build_supports(
         self,
@@ -83,10 +118,28 @@ class CAPENLlamaAtt(CAPENLlama):
             getattr(self, "incidence_m22", False)
         ):
             self._pending_is_hyper = None
+            self._pending_m22_full = None
             return supports_without_m22(s_bool)
         m_11, m_21, m_12, m_22 = super()._build_supports(s_bool, mask=mask)
+        if self.typed_edge_streams:
+            # Hyperedges (deg>2) only for M22; placeholder identity avoids a
+            # dense all-edge M22 in the generic path. M12/M21 stay full
+            # incidence (all edges).
+            deg = s_bool.to(dtype=torch.float32).sum(dim=-1)
+            is_hyper = deg > 2
+            edge_mask = self._pending_edge_mask
+            if edge_mask is not None:
+                is_hyper = is_hyper & edge_mask.to(
+                    device=is_hyper.device, dtype=torch.bool
+                )
+            self._pending_is_hyper = is_hyper
+            self._pending_m22_full = None
+            eye = torch.eye(m_22.size(-1), device=m_22.device, dtype=torch.bool)
+            m_22 = eye.unsqueeze(0).expand(m_22.size(0), -1, -1).contiguous()
+            return m_11, m_21, m_12, m_22
         if not self.hyperedge_m22_only:
             self._pending_is_hyper = None
+            self._pending_m22_full = None
             return m_11, m_21, m_12, m_22
 
         # Degree > 2 ⇒ hyperedge (DBSCAN / virtual hyper); 2-edges stay identity-only.
@@ -96,6 +149,7 @@ class CAPENLlamaAtt(CAPENLlama):
         if edge_mask is not None:
             is_hyper = is_hyper & edge_mask.to(device=is_hyper.device, dtype=torch.bool)
         self._pending_is_hyper = is_hyper
+        self._pending_m22_full = None
         # Cheap placeholder: identity only. Real M22 runs on the hyper subset in
         # ``_run_attn`` (avoids allocating bool/float ``M×M`` attention).
         eye = torch.eye(m_22.size(-1), device=m_22.device, dtype=torch.bool)
@@ -117,14 +171,26 @@ class CAPENLlamaAtt(CAPENLlama):
     ) -> torch.Tensor:
         if (
             relation == "22"
-            and self.hyperedge_m22_only
+            and self.typed_edge_streams
             and not bool(getattr(self, "identity_m22", False))
             and not bool(getattr(self, "incidence_m22", False))
         ):
-            return self._run_attn_22_hyper_subset(
+            # Typed forward builds f_22 explicitly; this path should not run.
+            raise RuntimeError("typed_edge_streams builds M22 via subset helpers")
+        if (
+            relation == "22"
+            and self.hyperedge_m22_only
+            and not self.typed_edge_streams
+            and not bool(getattr(self, "identity_m22", False))
+            and not bool(getattr(self, "incidence_m22", False))
+        ):
+            return self._run_attn_22_member_subset(
                 module,
                 target,
                 source,
+                member_mask=self._pending_is_hyper,
+                full_support=None,
+                zeros_elsewhere=False,
                 probe=probe,
             )
         return super()._run_attn(
@@ -139,45 +205,63 @@ class CAPENLlamaAtt(CAPENLlama):
             wire=wire,
         )
 
-    def _run_attn_22_hyper_subset(
+    def _run_attn_22_member_subset(
         self,
         module: nn.Module,
         target: torch.Tensor,
         source: torch.Tensor,
         *,
+        member_mask: torch.Tensor | None,
+        full_support: torch.Tensor | None = None,
+        zeros_elsewhere: bool = False,
         probe: dict | None = None,
     ) -> torch.Tensor:
-        """``f_22`` among hyperedges only; identity on pairwise / pad slots."""
-        is_hyper = self._pending_is_hyper
-        if is_hyper is None:
-            unused = sum((p * 0.0).sum() for p in module.parameters())
-            return target + unused
+        """``f_22`` among ``member_mask`` rows; identity or zeros elsewhere.
 
-        is_hyper = is_hyper.to(device=target.device, dtype=torch.bool)
+        ``full_support=None`` → all-to-all among members (star block).
+        ``full_support`` → gather the incidence M22 sub-block (knn block).
+        """
+        if member_mask is None:
+            unused = sum((p * 0.0).sum() for p in module.parameters())
+            base = target.new_zeros(target.shape) if zeros_elsewhere else target
+            return base + unused
+
+        member_mask = member_mask.to(device=target.device, dtype=torch.bool)
         batch, n_edges, width = target.shape
-        counts = is_hyper.sum(dim=-1)
+        counts = member_mask.sum(dim=-1)
         max_h = int(counts.max().item()) if batch > 0 else 0
         if max_h <= 0:
             unused = sum((p * 0.0).sum() for p in module.parameters())
-            return target + unused
+            base = target.new_zeros(target.shape) if zeros_elsewhere else target
+            return base + unused
 
-        # Padded gather indices (B, H_max); invalid slots reuse index 0 but are masked.
         idx = target.new_zeros(batch, max_h, dtype=torch.long)
-        hyp_ok = torch.zeros(batch, max_h, dtype=torch.bool, device=target.device)
+        mem_ok = torch.zeros(batch, max_h, dtype=torch.bool, device=target.device)
         for b in range(batch):
-            ix = is_hyper[b].nonzero(as_tuple=False).flatten()
+            ix = member_mask[b].nonzero(as_tuple=False).flatten()
             n = int(ix.numel())
             if n == 0:
                 continue
             idx[b, :n] = ix
-            hyp_ok[b, :n] = True
+            mem_ok[b, :n] = True
 
         gather_idx = idx.unsqueeze(-1).expand(batch, max_h, width)
         tgt_h = torch.gather(target, 1, gather_idx)
         src_h = torch.gather(source, 1, gather_idx)
-        support_h = hyp_ok.unsqueeze(-1) & hyp_ok.unsqueeze(-2)
+        if full_support is None:
+            support_h = mem_ok.unsqueeze(-1) & mem_ok.unsqueeze(-2)
+        else:
+            supp = full_support.to(device=target.device, dtype=torch.bool)
+            support_h = torch.zeros(
+                batch, max_h, max_h, dtype=torch.bool, device=target.device
+            )
+            for b in range(batch):
+                n = int(counts[b].item())
+                if n <= 0:
+                    continue
+                ix = idx[b, :n]
+                support_h[b, :n, :n] = supp[b][ix][:, ix]
 
-        # Bypass this override's hyper path via super() → CAPEN wrapper → bytecode.
         out_h = super()._run_attn(
             module,
             tgt_h,
@@ -187,14 +271,32 @@ class CAPENLlamaAtt(CAPENLlama):
             probe=probe,
         )
 
-        # Autocast may return bf16 while ``target`` (and thus ``out``) stays fp32.
-        out = target.clone()
+        out = target.new_zeros(target.shape) if zeros_elsewhere else target.clone()
         out_h = out_h.to(dtype=out.dtype)
         for b in range(batch):
             n = int(counts[b].item())
             if n > 0:
                 out[b, idx[b, :n]] = out_h[b, :n]
         return out
+
+    # Back-compat name used by older call sites / docs.
+    def _run_attn_22_hyper_subset(
+        self,
+        module: nn.Module,
+        target: torch.Tensor,
+        source: torch.Tensor,
+        *,
+        probe: dict | None = None,
+    ) -> torch.Tensor:
+        return self._run_attn_22_member_subset(
+            module,
+            target,
+            source,
+            member_mask=self._pending_is_hyper,
+            full_support=None,
+            zeros_elsewhere=False,
+            probe=probe,
+        )
 
     @staticmethod
     def _mask_mean(tokens: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -359,6 +461,8 @@ class CAPENLlamaAtt(CAPENLlama):
         edge_type: torch.Tensor | None = None,  # noqa: ARG002 — optional; degree drives M22
         edge_mask: torch.Tensor | None = None,
         node_mask: torch.Tensor | None = None,
+        edge_x_star: torch.Tensor | None = None,
+        edge_x_knn: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if bool(getattr(self, "m11_only", False)):
             return self._forward_m11_only(
@@ -372,7 +476,17 @@ class CAPENLlamaAtt(CAPENLlama):
             raise ValueError(
                 f"Expected x shape (batch, n_particles, n_features); got {tuple(x.shape)}"
             )
-        if edge_x is None or edge_x.dim() != 3:
+        typed = bool(self.typed_edge_streams)
+        if typed:
+            if edge_x_star is None or edge_x_knn is None:
+                raise ValueError(
+                    "typed_edge_streams requires edge_x_star and edge_x_knn"
+                )
+            if edge_x_star.dim() != 3 or edge_x_knn.dim() != 3:
+                raise ValueError(
+                    "edge_x_star / edge_x_knn must be (batch, n_edges, n_features)"
+                )
+        elif edge_x is None or edge_x.dim() != 3:
             raise ValueError(
                 f"CAPEN expects sparse edge features (batch, n_edges, m_0); got {None if edge_x is None else tuple(edge_x.shape)}"
             )
@@ -381,9 +495,19 @@ class CAPENLlamaAtt(CAPENLlama):
         self._pending_edge_type = edge_type
         self._pending_edge_mask = edge_mask
         self._pending_is_hyper = None
+        self._pending_is_star = None
+        self._pending_is_knn = None
+        self._pending_m22_full = None
         try:
             num_nodes = x.size(1)
-            num_edges = edge_x.size(1)
+            if typed:
+                n_star = int(edge_x_star.size(1))
+                n_knn = int(edge_x_knn.size(1))
+                num_edges = n_star + n_knn
+            else:
+                n_star = 0
+                n_knn = 0
+                num_edges = edge_x.size(1)
             s_bool = self._resolve_dense_incidence(
                 incidence=incidence,
                 incidence_node=incidence_node,
@@ -395,6 +519,22 @@ class CAPENLlamaAtt(CAPENLlama):
             )
             if bool(getattr(self, "incidence_m22", False)):
                 self._pending_s = s_bool.to(dtype=torch.float32)
+
+            if typed:
+                is_star = torch.zeros(
+                    s_bool.size(0), num_edges, dtype=torch.bool, device=x.device
+                )
+                is_star[:, :n_star] = True
+                is_knn = ~is_star
+                live = s_bool.any(dim=-1)
+                if edge_mask is not None:
+                    live = live & edge_mask.to(device=live.device, dtype=torch.bool)
+                self._pending_is_star = is_star & live
+                self._pending_is_knn = is_knn & live
+                if edge_mask is None:
+                    edge_mask = live
+
+            self._pending_edge_mask = edge_mask
             m_11, m_21, m_12, m_22 = self._build_supports(s_bool, mask=node_mask_eff)
 
             wire_coords = None
@@ -413,7 +553,16 @@ class CAPENLlamaAtt(CAPENLlama):
                 )
 
             h_x = self.encoder_x(x) * self._encoder_x_scale
-            h_e = self.encoder_e(edge_x) * self._encoder_e_scale
+            if typed:
+                h_star = (
+                    self.encoder_e_star(edge_x_star) * self._encoder_e_star_scale
+                )
+                h_knn = self.encoder_e_knn(edge_x_knn) * self._encoder_e_knn_scale
+                h_e = torch.cat([h_star, h_knn], dim=1)
+                # Keep shared encoder_e in the graph for DDP unused-param guards.
+                h_e = h_e + (self.encoder_e.weight * 0).sum()
+            else:
+                h_e = self.encoder_e(edge_x) * self._encoder_e_scale
             self._record_probe("encode", h_x, h_e, node_mask_eff)
 
             for layer_idx in range(self.depth):
@@ -441,25 +590,65 @@ class CAPENLlamaAtt(CAPENLlama):
                     relation="21",
                     probe=self._attn_probe_entry(layer_idx, "21"),
                 )
-                f_22 = self._run_attn(
-                    self.attn_22[layer_idx],
-                    e_ln,
-                    e_ln,
-                    m_22,
-                    relation="22",
-                    probe=self._attn_probe_entry(layer_idx, "22"),
-                )
-                f_12 = self._run_attn(
-                    self.attn_12[layer_idx],
-                    e_ln,
-                    x_ln,
-                    m_12,
-                    relation="12",
-                    probe=self._attn_probe_entry(layer_idx, "12"),
-                )
-                attn_s = self._attn_residual_scale
-                h_x = h_x + attn_s * (f_11 + f_21)
-                h_e = h_e + attn_s * (f_22 + f_12)
+                if typed:
+                    # §1: hyper↔hyper M22 only; f_22=0 on knn / tiny stars.
+                    # M12 on all live edges; M21 unmasked into particles.
+                    f_22 = self._run_attn_22_member_subset(
+                        self.attn_22[layer_idx],
+                        e_ln,
+                        e_ln,
+                        member_mask=self._pending_is_hyper,
+                        full_support=None,
+                        zeros_elsewhere=True,
+                        probe=self._attn_probe_entry(layer_idx, "22"),
+                    )
+                    f_12 = self._run_attn(
+                        self.attn_12[layer_idx],
+                        e_ln,
+                        x_ln,
+                        m_12,
+                        relation="12",
+                        probe=self._attn_probe_entry(layer_idx, "12"),
+                    )
+                    hyper = self._pending_is_hyper
+                    assert hyper is not None
+                    live = (
+                        edge_mask
+                        if edge_mask is not None
+                        else torch.ones_like(hyper)
+                    )
+                    live = live.to(device=hyper.device, dtype=torch.bool)
+                    hyper_w = hyper.unsqueeze(-1).to(dtype=f_12.dtype)
+                    nonhyper_w = ((~hyper) & live).unsqueeze(-1).to(dtype=f_12.dtype)
+                    attn_s = self._attn_residual_scale
+                    attn_s1 = self._attn_residual_scale_single
+                    h_x = h_x + attn_s * (f_11 + f_21)
+                    # Hyper: two edge branches → 1/(√2 L). Non-hyper: M12 only → 1/L.
+                    h_e = (
+                        h_e
+                        + attn_s * hyper_w * (f_22 + f_12)
+                        + attn_s1 * nonhyper_w * f_12
+                    )
+                else:
+                    f_22 = self._run_attn(
+                        self.attn_22[layer_idx],
+                        e_ln,
+                        e_ln,
+                        m_22,
+                        relation="22",
+                        probe=self._attn_probe_entry(layer_idx, "22"),
+                    )
+                    f_12 = self._run_attn(
+                        self.attn_12[layer_idx],
+                        e_ln,
+                        x_ln,
+                        m_12,
+                        relation="12",
+                        probe=self._attn_probe_entry(layer_idx, "12"),
+                    )
+                    attn_s = self._attn_residual_scale
+                    h_x = h_x + attn_s * (f_11 + f_21)
+                    h_e = h_e + attn_s * (f_22 + f_12)
                 mlp_s = self._mlp_residual_scale
                 h_x = h_x + mlp_s * self._mlp(
                     h_x,
@@ -485,6 +674,9 @@ class CAPENLlamaAtt(CAPENLlama):
             self._pending_edge_type = None
             self._pending_edge_mask = None
             self._pending_is_hyper = None
+            self._pending_is_star = None
+            self._pending_is_knn = None
+            self._pending_m22_full = None
             self._pending_s = None
 
 

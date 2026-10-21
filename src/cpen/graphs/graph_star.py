@@ -534,7 +534,8 @@ def build_star_kin7_plus_knn_graph(
     part_interaction_preprocess: PartInteractionPreprocess | None = None,
     standardize_knn: bool = True,
     include_self: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    typed_features: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Canonical star-$R$ hyperedges with **kin7 aggregate** features + ΔR-kNN.
 
@@ -542,9 +543,15 @@ def build_star_kin7_plus_knn_graph(
       ``seed_min_pt>0`` to optionally drop soft centers.
     * **Support:** ΔR ball of radius ``radius`` (plus the seed).
     * **Star feature:** ParT kin7 of the support 4-vector **sum** vs the jet.
-    * **kNN:** part-interaction (4), zero-padded to 7 for a shared edge encoder.
+    * **kNN:** part-interaction (4).
 
-    Layout: ``[star (N) | knn (N·k)]``, edge feature dim = 7.
+    Layout: ``[star (N) | knn (N·k)]``.
+
+    When ``typed_features=False`` (default, legacy): kNN is zero-padded to 7 and
+    the return is ``(edge_x, incidence)`` with feature dim 7.
+
+    When ``typed_features=True``: no padding; return
+    ``(edge_x_star, edge_x_knn, incidence)`` with dims 7 and 4.
     """
     from cpen.apps.jets.part_kin import (
         N_PART_KIN_FEATURES,
@@ -593,12 +600,13 @@ def build_star_kin7_plus_knn_graph(
         standardize=standardize_knn,
         include_self=include_self,
     )
+    incidence = torch.cat([star_inc, knn_inc.to(dtype)], dim=1)
+    if typed_features:
+        return star_x, knn_x.to(dtype), incidence
+
     knn_pad = torch.zeros(batch, knn_x.size(1), n_ef, device=device, dtype=dtype)
     knn_pad[..., : knn_x.size(-1)] = knn_x.to(dtype)
-
-    return torch.cat([star_x, knn_pad], dim=1), torch.cat(
-        [star_inc, knn_inc.to(dtype)], dim=1
-    )
+    return torch.cat([star_x, knn_pad], dim=1), incidence
 
 
 def build_star_radius_graph_single(

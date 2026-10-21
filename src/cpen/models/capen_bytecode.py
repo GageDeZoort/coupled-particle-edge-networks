@@ -470,30 +470,93 @@ class CAPEN(nn.Module):
             logit_temperature=temp,
         )
         if probe is not None:
-            # Best-effort diversity stats from a second pass is expensive; skip
-            # raw weights and fill placeholders from a cheap proxy if needed.
-            # Tests only require entropy/eff_width/max_weight shapes when probe is on.
-            # Recompute weights lightly for stats.
+            # Diagnostic second pass: diversity + numerical pathology stats.
+            # Tests require entropy/eff_width/max_weight shapes when probe is on.
             with torch.no_grad():
                 scale = module._proj_scale
                 b, n_t, _ = target.shape
                 n_s = source.size(1)
                 q = (module.wq(target) * scale).view(b, n_t, module.heads, module.head_dim)
                 k = (module.wk(source) * scale).view(b, n_s, module.heads, module.head_dim)
+                v = (module.wv(source) * scale).view(b, n_s, module.heads, module.head_dim)
+                if (
+                    wire is not None
+                    and target_coordinates is not None
+                    and source_coordinates is not None
+                ):
+                    q, k = wire(q, k, target_coordinates, source_coordinates)
                 logits = torch.einsum("bihd,bjhd->bhij", q, k) * module._logit_scale
                 if temp != 1.0:
                     logits = logits / temp
-                weights = module._attention_weights(logits, support.bool())
-                stats = attention_diversity_stats(weights, support.bool())
+                supp = support.bool()
+                weights = module._attention_weights(logits, supp)
+                stats = attention_diversity_stats(weights, supp)
                 if stats is not None:
                     probe.update(stats)
                 # Mean support size over nonempty target rows.
-                row_deg = support.bool().sum(dim=-1).to(dtype=torch.float32)
-                nonempty = support.bool().any(dim=-1)
+                row_deg = supp.sum(dim=-1).to(dtype=torch.float32)
+                nonempty = supp.any(dim=-1)
                 if nonempty.any():
                     probe["support_size"] = float(row_deg[nonempty].mean().item())
                 else:
                     probe["support_size"] = 0.0
+
+                # Per-head pathology proxies (H,).
+                def _rms_heads(t: torch.Tensor) -> torch.Tensor:
+                    # t: (B, N, H, Dh) → (H,)
+                    return t.float().pow(2).mean(dim=(0, 1, 3)).sqrt()
+
+                probe["q_rms"] = _rms_heads(q)
+                probe["k_rms"] = _rms_heads(k)
+                probe["v_rms"] = _rms_heads(v)
+                ctx = torch.einsum("bhij,bjhd->bihd", weights, v)
+                probe["ctx_rms"] = ctx.float().pow(2).mean(dim=(0, 1, 3)).sqrt()
+                # Combined WO output is not per-head; store a scalar broadcast.
+                out_rms = float(out.float().pow(2).mean().sqrt().item())
+                probe["out_rms"] = out.new_full((module.heads,), out_rms)
+
+                supp_h = supp.unsqueeze(1)  # (B,1,T,S)
+                logits_f = logits.float()
+                # Mask unsupported entries when reporting logit extremes.
+                neg = torch.finfo(torch.float32).min
+                logits_m = logits_f.masked_fill(~supp_h, neg)
+                # (B,H,T) → mean over nonempty → (H,)
+                nonempty_h = nonempty.unsqueeze(1).expand_as(logits_m[..., 0])
+                abs_logits = logits_m.abs()
+                abs_logits = abs_logits.masked_fill(~supp_h, 0.0)
+
+                def _mean_over_rows(x_bht: torch.Tensor) -> torch.Tensor:
+                    out_h = []
+                    for h in range(x_bht.size(1)):
+                        m = nonempty_h[:, h]
+                        out_h.append(
+                            x_bht[:, h][m].mean() if m.any() else x_bht.new_zeros(())
+                        )
+                    return torch.stack(out_h)
+
+                probe["logit_abs_max"] = abs_logits.amax(dim=(0, 2, 3))
+                probe["logit_abs_mean"] = _mean_over_rows(
+                    abs_logits.sum(dim=-1)
+                    / supp_h.to(abs_logits.dtype).sum(dim=-1).clamp_min(1.0)
+                )
+                probe["n_nan_logits"] = (~torch.isfinite(logits_f) & supp_h).sum(
+                    dim=(0, 2, 3)
+                ).to(torch.float32)
+                probe["n_inf_logits"] = (
+                    torch.isinf(logits_f) & supp_h
+                ).sum(dim=(0, 2, 3)).to(torch.float32)
+                probe["n_nan_weights"] = (
+                    ~torch.isfinite(weights.float()) & supp_h
+                ).sum(dim=(0, 2, 3)).to(torch.float32)
+                # Softmax row mass on nonempty supported rows (should be ≈1).
+                row_sum = (weights.float() * supp_h.to(torch.float32)).sum(dim=-1)
+                mass_err = (row_sum - 1.0).abs()
+                mass_err = mass_err.masked_fill(~nonempty_h, 0.0)
+                probe["row_mass_err_max"] = mass_err.amax(dim=(0, 2))
+                probe["row_mass_err_mean"] = _mean_over_rows(mass_err)
+                probe["logit_temperature"] = float(temp)
+                probe["n_nan_out"] = float((~torch.isfinite(out)).sum().item())
+                probe["n_inf_out"] = float(torch.isinf(out.float()).sum().item())
         return out
 
     def _mlp(self, h: torch.Tensor, w1: nn.Module, w2: nn.Module) -> torch.Tensor:
