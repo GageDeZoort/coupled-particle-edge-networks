@@ -308,7 +308,10 @@ class BaseLitCPEN(L.LightningModule):
                 from cpen.graphs.graph_star import build_star_kin7_plus_knn_graph
 
                 if self.live_typed_edge_streams:
-                    star_x, knn_x, incidence = build_star_kin7_plus_knn_graph(
+                    need_knn_index = str(
+                        getattr(model, "edge_bias_m11", "none") or "none"
+                    ) != "none"
+                    graph_out = build_star_kin7_plus_knn_graph(
                         x_raw,
                         radius=float(self.live_star_radius),
                         k=int(self.live_graph_k),
@@ -317,7 +320,14 @@ class BaseLitCPEN(L.LightningModule):
                         part_interaction_preprocess=self.live_part_interaction_preprocess,
                         include_self=self.live_knn_include_self,
                         typed_features=True,
+                        return_knn_index=need_knn_index,
                     )
+                    if need_knn_index:
+                        star_x, knn_x, incidence, knn_dst, knn_valid = graph_out
+                        batch["knn_dst"] = knn_dst
+                        batch["knn_valid"] = knn_valid
+                    else:
+                        star_x, knn_x, incidence = graph_out
                     batch["edge_x_star"] = star_x
                     batch["edge_x_knn"] = knn_x
                     batch["incidence"] = incidence
@@ -439,6 +449,10 @@ class BaseLitCPEN(L.LightningModule):
                 kwargs["edge_x_star"] = batch["edge_x_star"]
             if batch.get("edge_x_knn") is not None:
                 kwargs["edge_x_knn"] = batch["edge_x_knn"]
+            if batch.get("knn_dst") is not None:
+                kwargs["knn_dst"] = batch["knn_dst"]
+            if batch.get("knn_valid") is not None:
+                kwargs["knn_valid"] = batch["knn_valid"]
             return kwargs
 
         if isinstance(model, ParticleOnlyNetwork) and "adjacency" in model.operator_names:

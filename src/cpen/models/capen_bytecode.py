@@ -191,6 +191,7 @@ class SupportAttention(nn.Module):
         source_coordinates: torch.Tensor | None = None,
         wire: nn.Module | None = None,
         logit_temperature: float = 1.0,
+        attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if target.dim() != 3 or source.dim() != 3:
             raise ValueError("target/source must be (batch, tokens, width)")
@@ -206,6 +207,12 @@ class SupportAttention(nn.Module):
         temp = float(logit_temperature)
         if temp != 1.0:
             logits = logits / temp
+        if attn_bias is not None:
+            if attn_bias.shape != logits.shape:
+                raise ValueError(
+                    f"attn_bias shape {tuple(attn_bias.shape)} != logits {tuple(logits.shape)}"
+                )
+            logits = logits + attn_bias
         weights = self._attention_weights(logits, support.bool())
         ctx = torch.einsum("bhij,bjhd->bihd", weights, v)
         if self.head_combine == "mean":
@@ -458,6 +465,7 @@ class CAPEN(nn.Module):
         target_coordinates: torch.Tensor | None = None,
         source_coordinates: torch.Tensor | None = None,
         wire: nn.Module | None = None,
+        attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         temp = self._gamma_for(relation)
         out = module(
@@ -468,6 +476,7 @@ class CAPEN(nn.Module):
             source_coordinates=source_coordinates,
             wire=wire,
             logit_temperature=temp,
+            attn_bias=attn_bias,
         )
         if probe is not None:
             # Diagnostic second pass: diversity + numerical pathology stats.
@@ -488,6 +497,8 @@ class CAPEN(nn.Module):
                 logits = torch.einsum("bihd,bjhd->bhij", q, k) * module._logit_scale
                 if temp != 1.0:
                     logits = logits / temp
+                if attn_bias is not None:
+                    logits = logits + attn_bias
                 supp = support.bool()
                 weights = module._attention_weights(logits, supp)
                 # Support-size stratified entropy / max-weight / logit spread /

@@ -212,6 +212,7 @@ class CAPEN(_BaseCAPEN):
         target_coordinates: torch.Tensor | None = None,
         source_coordinates: torch.Tensor | None = None,
         wire: nn.Module | None = None,
+        attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.identity_m22 and relation == "22":
             unused = sum((p * 0.0).sum() for p in module.parameters())
@@ -231,6 +232,7 @@ class CAPEN(_BaseCAPEN):
             target_coordinates=target_coordinates,
             source_coordinates=source_coordinates,
             wire=wire,
+            attn_bias=attn_bias,
         )
 
 

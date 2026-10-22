@@ -254,6 +254,15 @@ def run_options_from_args(args):  # type: ignore[no-untyped-def]
         tags.append("fullm22")
     if bool(getattr(args, "typed_edge_streams", False)):
         tags.append("typed")
+    eb = str(getattr(args, "edge_bias_m11", "none") or "none").lower()
+    if eb == "dynamic":
+        tags.append("eb-dyn")
+    elif eb == "static":
+        tags.append("eb-sta")
+    if bool(getattr(args, "no_m21", False)):
+        tags.append("nom21")
+    if str(getattr(args, "gamma21_mode", "mean") or "mean").lower() == "one":
+        tags.append("g21one")
     if bool(getattr(args, "uniform_output_pool", False)):
         tags.append("unipool")
     if bool(getattr(args, "hyperedge_only", False)):
@@ -886,6 +895,39 @@ def add_common_args(parser):  # type: ignore[no-untyped-def]
         ),
     )
     parser.add_argument(
+        "--edge-bias-m11",
+        type=str,
+        default="none",
+        choices=("none", "dynamic", "static"),
+        dest="edge_bias_m11",
+        help=(
+            "Typed CAPEN-Llama-att: add a learned per-head scalar from each "
+            "live kNN edge state into the M11 logit of that particle pair. "
+            "dynamic = e_ln at layer ℓ; static = LN(h_e^(0)). Requires "
+            "--typed-edge-streams. Tags eb-dyn / eb-sta."
+        ),
+    )
+    parser.add_argument(
+        "--no-m21",
+        action="store_true",
+        dest="no_m21",
+        help=(
+            "Typed CAPEN-Llama-att: drop particle←edge M21 (no attn_21 params; "
+            "particle attn residual 1/L). Tags nom21."
+        ),
+    )
+    parser.add_argument(
+        "--gamma21-mode",
+        type=str,
+        default="mean",
+        choices=("mean", "one"),
+        dest="gamma21_mode",
+        help=(
+            "After γ estimation/clamp: mean keeps estimated γ21; one forces "
+            "γ21=1 (arm C). Tags g21one when one."
+        ),
+    )
+    parser.add_argument(
         "--uniform-output-pool",
         action="store_true",
         dest="uniform_output_pool",
@@ -1353,6 +1395,12 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
         typed = cls is CAPENLlamaAtt and bool(
             getattr(args, "typed_edge_streams", False)
         )
+        eb = str(getattr(args, "edge_bias_m11", "none") or "none").lower()
+        if eb != "none" and not typed:
+            raise ValueError("--edge-bias-m11 requires --typed-edge-streams")
+        no_m21 = bool(getattr(args, "no_m21", False))
+        if no_m21 and not typed:
+            raise ValueError("--no-m21 requires --typed-edge-streams")
         model = cls(
             n_features=n_features,
             n_edge_features=n_edge_features,
@@ -1391,6 +1439,8 @@ def build_model(args, *, n_features, n_edge_features, out_dim, depth, width, hea
             typed_edge_streams=typed,
             n_star_edge_features=7,
             n_knn_edge_features=4,
+            edge_bias_m11=eb if typed else "none",
+            m21=(not no_m21) if typed else True,
         )
         return model
     # capen / capen-llama / particle-only: original factory (attention dropout only for CAPEN*).
@@ -1556,6 +1606,10 @@ def _clamp_all_to_all_gammas(args, gammas):  # type: ignore[no-untyped-def]
         if abs(g22 - 1.0) > 1e-12:
             notes.append(f"γ22 {g22:.4f}→1 (hyperedge all-to-all M22)")
         g22 = 1.0
+    if str(getattr(args, "gamma21_mode", "mean") or "mean").lower() == "one":
+        if abs(g21 - 1.0) > 1e-12:
+            notes.append(f"γ21 {g21:.4f}→1 (--gamma21-mode one)")
+        g21 = 1.0
     return AttentionGammas(gamma_11=g11, gamma_12=g12, gamma_21=g21, gamma_22=g22), notes
 
 

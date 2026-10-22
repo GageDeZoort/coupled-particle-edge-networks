@@ -101,6 +101,23 @@ on sparse incidence-like supports:
 
 Code: `CAPEN._gamma_for` + `sweep_common._clamp_all_to_all_gammas`.
 
+### §2b Edge→M11 logit bias (`--edge-bias-m11`)
+
+Optional typed-stream branch (does **not** change residual \(n_{\mathrm{src}}\)).
+Each layer has a bias-free readout \(W_b^{(\ell)}\in\mathbb{R}^{H\times D}\):
+
+\[
+W_b^{(\ell)}\sim\mathcal N(0,\sigma^2),\quad
+\sigma=D^{-1/2},\qquad
+u = \frac{1}{D\sigma}\,W_b^{(\ell)}e_{\mathrm{ln}}
+  = \frac{1}{\sqrt{D}}\,W_b^{(\ell)}e_{\mathrm{ln}},
+\]
+
+added to the M11 logit of the directed kNN pair after the \(1/d_{\mathrm{head}}\)
+scale (no extra \(\gamma\) / \(1/L\)). `dynamic` uses \(e_{\mathrm{ln}}^{(\ell)}\);
+`static` freezes \(e_{\mathrm{ln}}^{(0)}=\mathrm{LN}(h_e^{(0)})\). \(W_b\) sits in
+the main Adam group \(\eta_0/\sqrt{D}\) (not an encoder / `corr` param).
+
 ---
 
 ## 3. Residual branch multipliers
@@ -266,6 +283,7 @@ is equivalent to \(U\sim\mathcal N(0,1)\) with multiplier \(1/D\).
 
 | Date | Note |
 |---|---|
+| 2026-10-21 | §2b edge→M11 logit bias: \(W_b\sim N(0,\sigma^2)\), ×\(1/(D\sigma)\), main LR group, no \(1/L\). |
 | 2026-10-21 | Typed dual encoders: same \(N(0,\sigma^2)\) with \(\sigma=D^{-1/2}\) (not `init_std=1`); drop dead shared `encoder_e`; `corr` covers `encoder_e_{star,knn}`; typed skips \(\gamma_{22}\) in-model. |
 | 2026-10-07 | Pool: multi-head concat \(\frac{1}{D\sigma}\sum_h W_{O,h}v_h\) (match trunk \(H\)); skip \(\gamma\) on all-to-all \(M_{11}/M_{22}\); keep \(\gamma_{12,21}\). BaselineTransformer residual \(1/L\) (no \(\sqrt{2}\)). |
 | 2026-10-02 | File created after encoder \(N(0,1)\) bug broke uniform output \(\Delta\rho\). Encoder confirmed as \(N(0,\sigma^2)\) × \(1/(\sigma\sqrt{n_0})\). |

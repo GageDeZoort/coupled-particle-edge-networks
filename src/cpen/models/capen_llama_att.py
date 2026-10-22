@@ -32,6 +32,7 @@ CAPEN-Llama behaviour.
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 from torch import nn
@@ -39,6 +40,8 @@ from torch import nn
 from cpen.models.capen import supports_without_m22
 from cpen.models.capen_llama import CAPENLlama
 from cpen.models.output_attention_pool import OutputAttentionPool
+
+EdgeBiasM11 = Literal["none", "dynamic", "static"]
 
 
 class CAPENLlamaAtt(CAPENLlama):
@@ -55,6 +58,8 @@ class CAPENLlamaAtt(CAPENLlama):
         typed_edge_streams: bool = False,
         n_star_edge_features: int = 7,
         n_knn_edge_features: int = 4,
+        edge_bias_m11: EdgeBiasM11 = "none",
+        m21: bool = True,
         **kwargs,
     ):  # type: ignore[no-untyped-def]
         super().__init__(*args, **kwargs)
@@ -68,12 +73,23 @@ class CAPENLlamaAtt(CAPENLlama):
         self.typed_edge_streams = bool(typed_edge_streams)
         self.n_star_edge_features = int(n_star_edge_features)
         self.n_knn_edge_features = int(n_knn_edge_features)
+        mode = str(edge_bias_m11 or "none").lower()
+        if mode not in {"none", "dynamic", "static"}:
+            raise ValueError(
+                f"edge_bias_m11 must be none|dynamic|static; got {edge_bias_m11!r}"
+            )
+        self.edge_bias_m11: EdgeBiasM11 = mode  # type: ignore[assignment]
+        self.m21 = bool(m21)
         if self.m11_only and bool(getattr(self, "use_wire", False)):
             raise ValueError(
                 "m11_only / BaselineTransformer cannot use WIRE (needs a graph Laplacian)"
             )
         if self.typed_edge_streams and self.m11_only:
             raise ValueError("typed_edge_streams is incompatible with m11_only")
+        if self.edge_bias_m11 != "none" and not self.typed_edge_streams:
+            raise ValueError("edge_bias_m11 requires typed_edge_streams=True")
+        if not self.m21 and not self.typed_edge_streams:
+            raise ValueError("m21=False is only supported with typed_edge_streams")
         if self.uniform_output_pool:
             self.output_pool = None
         else:
@@ -112,6 +128,21 @@ class CAPENLlamaAtt(CAPENLlama):
             self._encoder_e_knn_scale = math.sqrt(d / float(n_k))
             # Drop unused shared encoder so it is not in P / corr groups / DDP.
             del self.encoder_e
+            if self.edge_bias_m11 != "none":
+                # Readout rule: W_b ~ N(0, σ²), forward × 1/(Dσ) = 1/√D.
+                self.bias_11 = nn.ModuleList(
+                    [
+                        nn.Linear(d, int(self.heads), bias=False)
+                        for _ in range(int(self.depth))
+                    ]
+                )
+                for lin in self.bias_11:
+                    nn.init.normal_(lin.weight, mean=0.0, std=sigma)
+                self._bias_scale = 1.0 / math.sqrt(d)
+            if not self.m21:
+                # Drop M21 params from P/DDP. Particle residual uses 1/L in forward
+                # (n_src=1); edge residuals stay typed §1 (hyper 1/(√2L), else 1/L).
+                del self.attn_21
 
     def _gamma_for(self, relation: str) -> float:
         # Typed §1 M22 is sparse hyper↔hyper gather/scatter — not dense all-to-all.
@@ -167,6 +198,38 @@ class CAPENLlamaAtt(CAPENLlama):
         m_22 = eye.unsqueeze(0).expand(m_22.size(0), -1, -1).contiguous()
         return m_11, m_21, m_12, m_22
 
+    def _m11_edge_bias(
+        self,
+        *,
+        layer_idx: int,
+        e_ln: torch.Tensor,
+        e_ln0: torch.Tensor | None,
+        knn_dst: torch.Tensor,
+        knn_valid: torch.Tensor,
+        n_star: int,
+        n_particles: int,
+    ) -> torch.Tensor:
+        """Build (B, H, N, N) M11 logit bias from live kNN edge slots."""
+        if self.edge_bias_m11 == "none":
+            raise RuntimeError("_m11_edge_bias called with edge_bias_m11=none")
+        z_src = e_ln0 if self.edge_bias_m11 == "static" else e_ln
+        if z_src is None:
+            raise RuntimeError("static edge bias requires e_ln0")
+        z = z_src[:, n_star:, :]  # (B, N*k, D)
+        bsz = int(z.size(0))
+        k = int(knn_dst.size(-1))
+        if z.size(1) != n_particles * k:
+            raise ValueError(
+                f"kNN edge count {z.size(1)} != N*k={n_particles * k}"
+            )
+        u = self.bias_11[layer_idx](z) * self._bias_scale  # (B, N*k, H)
+        u = u.view(bsz, n_particles, k, int(self.heads)).permute(0, 3, 1, 2)
+        u = u * knn_valid.unsqueeze(1).to(dtype=u.dtype)
+        idx = knn_dst.unsqueeze(1).expand(bsz, int(self.heads), n_particles, k)
+        bias = u.new_zeros(bsz, int(self.heads), n_particles, n_particles)
+        bias.scatter_add_(-1, idx, u)
+        return bias
+
     def _run_attn(
         self,
         module: nn.Module,
@@ -179,6 +242,7 @@ class CAPENLlamaAtt(CAPENLlama):
         target_coordinates: torch.Tensor | None = None,
         source_coordinates: torch.Tensor | None = None,
         wire: nn.Module | None = None,
+        attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if (
             relation == "22"
@@ -214,6 +278,7 @@ class CAPENLlamaAtt(CAPENLlama):
             target_coordinates=target_coordinates,
             source_coordinates=source_coordinates,
             wire=wire,
+            attn_bias=attn_bias,
         )
 
     def _run_attn_22_member_subset(
@@ -474,6 +539,8 @@ class CAPENLlamaAtt(CAPENLlama):
         node_mask: torch.Tensor | None = None,
         edge_x_star: torch.Tensor | None = None,
         edge_x_knn: torch.Tensor | None = None,
+        knn_dst: torch.Tensor | None = None,
+        knn_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if bool(getattr(self, "m11_only", False)):
             return self._forward_m11_only(
@@ -501,6 +568,11 @@ class CAPENLlamaAtt(CAPENLlama):
             raise ValueError(
                 f"CAPEN expects sparse edge features (batch, n_edges, m_0); got {None if edge_x is None else tuple(edge_x.shape)}"
             )
+        if self.edge_bias_m11 != "none":
+            if knn_dst is None or knn_valid is None:
+                raise ValueError(
+                    "edge_bias_m11 requires knn_dst and knn_valid from the graph builder"
+                )
 
         node_mask_eff = node_mask if node_mask is not None else mask
         self._pending_edge_type = edge_type
@@ -573,6 +645,7 @@ class CAPENLlamaAtt(CAPENLlama):
             else:
                 h_e = self.encoder_e(edge_x) * self._encoder_e_scale
             self._record_probe("encode", h_x, h_e, node_mask_eff)
+            e_ln0 = self.ln(h_e) if self.edge_bias_m11 == "static" else None
 
             for layer_idx in range(self.depth):
                 x_ln = self.ln(h_x)
@@ -580,25 +653,60 @@ class CAPENLlamaAtt(CAPENLlama):
                 rot_coords, rotary = self._relation_11_rotary(
                     layer_idx, rope_coords=rope_coords, wire_coords=wire_coords
                 )
+                attn_bias_11 = None
+                probe11 = self._attn_probe_entry(layer_idx, "11")
+                if self.edge_bias_m11 != "none":
+                    assert knn_dst is not None and knn_valid is not None
+                    attn_bias_11 = self._m11_edge_bias(
+                        layer_idx=layer_idx,
+                        e_ln=e_ln,
+                        e_ln0=e_ln0,
+                        knn_dst=knn_dst,
+                        knn_valid=knn_valid,
+                        n_star=n_star,
+                        n_particles=num_nodes,
+                    )
+                    if probe11 is not None:
+                        gathered = torch.gather(
+                            attn_bias_11,
+                            -1,
+                            knn_dst.unsqueeze(1).expand(
+                                attn_bias_11.size(0),
+                                attn_bias_11.size(1),
+                                num_nodes,
+                                knn_dst.size(-1),
+                            ),
+                        )
+                        m = knn_valid.unsqueeze(1).expand_as(gathered)
+                        if bool(m.any()):
+                            probe11["bias11_rms"] = (
+                                gathered[m].float().pow(2).mean().sqrt()
+                            )
+                        else:
+                            probe11["bias11_rms"] = gathered.new_zeros(())
                 f_11 = self._run_attn(
                     self.attn_11[layer_idx],
                     x_ln,
                     x_ln,
                     m_11,
                     relation="11",
-                    probe=self._attn_probe_entry(layer_idx, "11"),
+                    probe=probe11,
                     target_coordinates=rot_coords,
                     source_coordinates=rot_coords,
                     wire=rotary,
+                    attn_bias=attn_bias_11,
                 )
-                f_21 = self._run_attn(
-                    self.attn_21[layer_idx],
-                    x_ln,
-                    e_ln,
-                    m_21,
-                    relation="21",
-                    probe=self._attn_probe_entry(layer_idx, "21"),
-                )
+                if self.m21:
+                    f_21 = self._run_attn(
+                        self.attn_21[layer_idx],
+                        x_ln,
+                        e_ln,
+                        m_21,
+                        relation="21",
+                        probe=self._attn_probe_entry(layer_idx, "21"),
+                    )
+                else:
+                    f_21 = torch.zeros_like(f_11)
                 if typed:
                     # §1: hyper↔hyper M22 only; f_22=0 on knn / tiny stars.
                     # M12 on all live edges; M21 unmasked into particles.
@@ -631,7 +739,9 @@ class CAPENLlamaAtt(CAPENLlama):
                     nonhyper_w = ((~hyper) & live).unsqueeze(-1).to(dtype=f_12.dtype)
                     attn_s = self._attn_residual_scale
                     attn_s1 = self._attn_residual_scale_single
-                    h_x = h_x + attn_s * (f_11 + f_21)
+                    # Particles: 1/(√2 L) with M21, else 1/L (single branch).
+                    attn_sx = attn_s if self.m21 else attn_s1
+                    h_x = h_x + attn_sx * (f_11 + f_21)
                     # Hyper: two edge branches → 1/(√2 L). Non-hyper: M12 only → 1/L.
                     h_e = (
                         h_e

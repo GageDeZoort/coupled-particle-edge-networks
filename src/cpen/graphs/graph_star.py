@@ -386,7 +386,11 @@ def build_delta_r_knn_edges(
     part_interaction_preprocess: PartInteractionPreprocess | None = None,
     standardize: bool = True,
     include_self: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_index: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """
     Directed ΔR-kNN 2-edges among particles.
 
@@ -402,6 +406,8 @@ def build_delta_r_knn_edges(
     incidence:
         ``(B, N·k, N)`` — each live slot is a deg-2 edge (or deg-1 only if
         ``include_self=True`` and the self slot is selected).
+    knn_dst, knn_valid (optional, ``return_index=True``):
+        ``(B, N, k)`` destination indices (0-padded) and live-slot mask.
     """
     if k < 1:
         raise ValueError(f"k must be >= 1; got {k}")
@@ -415,9 +421,10 @@ def build_delta_r_knn_edges(
     batch, n_particles, _ = x_raw.shape
     device = x_raw.device
     dtype = x_raw.dtype
+    k_req = int(k)
     # When excluding self, at most N-1 neighbors exist.
-    knn_k = min(int(k), max(n_particles - (0 if include_self else 1), 1))
-    n_slots = n_particles * int(k)
+    knn_k = min(k_req, max(n_particles - (0 if include_self else 1), 1))
+    n_slots = n_particles * k_req
 
     eta, phi = eta_phi_from_four_vectors_torch(x_raw)
     dr = delta_r_torch(eta.unsqueeze(-1), phi.unsqueeze(-1), eta.unsqueeze(-2), phi.unsqueeze(-2))
@@ -440,7 +447,7 @@ def build_delta_r_knn_edges(
     )
     dst = knn_idx
     e_ids = (
-        torch.arange(n_particles, device=device).view(1, n_particles, 1) * int(k)
+        torch.arange(n_particles, device=device).view(1, n_particles, 1) * k_req
         + torch.arange(knn_k, device=device).view(1, 1, knn_k)
     ).expand(batch, -1, -1)
     b_ids = (
@@ -480,7 +487,16 @@ def build_delta_r_knn_edges(
             else:
                 feats = raw
         edge_x[flat_b, flat_e] = feats.to(dtype)
-    return edge_x, incidence
+
+    if not return_index:
+        return edge_x, incidence
+
+    # Right-pad rank axis to requested k (invalid slots → dst=0, valid=False).
+    knn_dst = torch.zeros(batch, n_particles, k_req, dtype=torch.long, device=device)
+    knn_valid = torch.zeros(batch, n_particles, k_req, dtype=torch.bool, device=device)
+    knn_dst[..., :knn_k] = knn_idx.to(dtype=torch.long)
+    knn_valid[..., :knn_k] = finite
+    return edge_x, incidence, knn_dst, knn_valid
 
 
 def build_star_plus_knn_graph(
@@ -535,7 +551,12 @@ def build_star_kin7_plus_knn_graph(
     standardize_knn: bool = True,
     include_self: bool = False,
     typed_features: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_knn_index: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """
     Canonical star-$R$ hyperedges with **kin7 aggregate** features + ΔR-kNN.
 
@@ -552,11 +573,17 @@ def build_star_kin7_plus_knn_graph(
 
     When ``typed_features=True``: no padding; return
     ``(edge_x_star, edge_x_knn, incidence)`` with dims 7 and 4.
+
+    When ``return_knn_index=True`` (requires ``typed_features``): also return
+    ``knn_dst, knn_valid`` with shapes ``(B, N, k)``.
     """
     from cpen.apps.jets.part_kin import (
         N_PART_KIN_FEATURES,
         build_part_kin_features_against_jet,
     )
+
+    if return_knn_index and not typed_features:
+        raise ValueError("return_knn_index requires typed_features=True")
 
     if mask is None:
         mask = particle_mask_from_four_vectors(x_raw)
@@ -590,7 +617,7 @@ def build_star_kin7_plus_knn_graph(
     star_x = build_part_kin_features_against_jet(agg, jet, mask=seed_ok)
     star_x = star_x.to(dtype) * seed_ok.unsqueeze(-1).to(dtype)
 
-    knn_x, knn_inc = build_delta_r_knn_edges(
+    knn_out = build_delta_r_knn_edges(
         x_raw,
         k=int(k),
         mask=mask,
@@ -599,9 +626,18 @@ def build_star_kin7_plus_knn_graph(
         part_interaction_preprocess=part_interaction_preprocess,
         standardize=standardize_knn,
         include_self=include_self,
+        return_index=bool(return_knn_index),
     )
+    if return_knn_index:
+        knn_x, knn_inc, knn_dst, knn_valid = knn_out
+    else:
+        knn_x, knn_inc = knn_out
+        knn_dst = knn_valid = None
     incidence = torch.cat([star_inc, knn_inc.to(dtype)], dim=1)
     if typed_features:
+        if return_knn_index:
+            assert knn_dst is not None and knn_valid is not None
+            return star_x, knn_x.to(dtype), incidence, knn_dst, knn_valid
         return star_x, knn_x.to(dtype), incidence
 
     knn_pad = torch.zeros(batch, knn_x.size(1), n_ef, device=device, dtype=dtype)
